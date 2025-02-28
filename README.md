@@ -33,7 +33,7 @@ The input parameters should be adjusted according to the specific input data, ei
 | Used CPU cores               | Integer | 1 to All                                   | All - 4      | Defines the number of CPU cores allocated to reduce processing time. Excessively high values may lead to RAM overuse and processing failure. |
 
 # Outputs
-
+Basic outputs are provided in **.shp** and **.tiff** formats. However, by enabling **"Debug"**, even point clouds from intermediate results will be saved in the processing folder in **.txt** format as well.
 <p align="center">
     <img src="/images/raw.png" alt="illustration1" width="45%">
     <img src="/images/identificationdetail.png" alt="illustration2" width="45%">
@@ -48,3 +48,14 @@ The input parameters should be adjusted according to the specific input data, ei
     <img src="/images/shapefiles.png" alt="illustration5" width="45%">
     <img src="/images/treetaper.png" alt="illustration6" width="45%">
 </p>
+
+
+# Autorship
+**Authors:**  
+Marek Hrdina¹\*  
+
+¹ Faculty of Forestry and Wood Sciences, Czech University of Life Sciences Prague,  
+Kamýcká 129, 16500 Prague, Czech Republic  
+
+\* **Corresponding author:** [hrdinam@fld.czu.cz](mailto:hrdinam@fld.czu.cz)
+
