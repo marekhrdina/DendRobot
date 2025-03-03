@@ -49,6 +49,9 @@ Basic outputs are provided in **.shp** and **.tiff** formats. However, by enabli
     <img src="/images/treetaper.png" alt="illustration6" width="45%">
 </p>
 
+# Known issues
+• def process_trees() is not using multiprocessing and is a huge bottleneck
+• def CropCloudByExtent() and its helper function need to use the "threading" backend while packed into exe. This is slower.
 
 # Autorship
 **Authors:**  
