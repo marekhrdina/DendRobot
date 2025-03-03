@@ -50,7 +50,7 @@ Basic outputs are provided in **.shp** and **.tiff** formats. However, by enabli
 </p>
 
 # Known issues
-• def process_trees() is not using multiprocessing and is a huge bottleneck
+• def process_trees() is not using multiprocessing and is a huge bottleneck<br>
 • def CropCloudByExtent() and its helper function need to use the "threading" backend while packed into exe. This is slower.
 
 # Autorship
