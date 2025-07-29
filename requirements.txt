@@ -8,9 +8,11 @@ joblib
 laspy
 laszip
 numpy==2.0.0
+numba
 open3d
 pandas
 psutil
+pyproj
 pyvista
 rasterio
 scipy
