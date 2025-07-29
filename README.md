@@ -24,7 +24,7 @@ The input parameters should be adjusted according to the specific input data, ei
 | Subsampling Step             | Float   | 0.01 to 0.2                                | 0.05         | The minimum step size between points in the subsampled point cloud. |
 | Cross Section Thickness      | Float   | 0.01 to 1.0                                | 0.07         | The size of the cross-section, which will later be used for RANSAC Circle Fitting. |
 | Cross Sections Count         | Integer | 1 to Any                                     | 3            | The number of cross-sections extracted for each tree, which will be used for RANSAC Circle Fitting. |
-| Cross Section Step      | Float   | 0.01 to 1.0                                | 0.07         | Determines how far from each other the cross-sections will be made. |
+| Cross Section Step      | Float   | 0.1 to 1.0                                | 1         | Determines how far from each other the cross-sections will be made. |
 | DTM Resolution               | Float   | 0.5 to 5                                   | 1            | The grid step for detecting minima within each grid cell. The DSM is generated at four times finer resolution. |
 | Filter-Chunk Size            | Float   | 1 to 100                                   | 10           | The sensitivity of density filtering to smaller objects. Higher values result in detecting only larger trees, whereas excessively low values may lead to improper terrain removal. |
 | Maximal DBH                 | Float   | 0.1 to 5                                   | 1.5          | A threshold for filtering out trees with unrealistic DBH estimate. |
