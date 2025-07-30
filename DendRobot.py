@@ -4240,10 +4240,7 @@ def DetectDeadStandingTrees(inputcloud,):
 # if __name__ == "__main__": 
 #     freeze_support()
 #     cloud = r"D:\MarekHrdina\Dropbox\Projekty\testing-pcds\farotiny.laz"
-#     #cloud = r"D:\MarekHrdina\Dropbox\Projekty\OrbisTurku\03Processed\ht\546571_rigid.laz"
 #     EstimatePlotParameters(cloud, debug=True, epsg=3067, datatype="MLS/TLS Cropped")
-#     #retos = MapScalarFields(cloud, r"D:\MarekHrdina\OneDrive - CZU v Praze\MAREK\Arbonaut\Projekty\DeadTrees-Metsakeskus\00PointClouds\test-Processing\16process_discsall-CloudStemDiscsProcessed.txt")
-#     #SavePointCloud(retos, r"D:\MarekHrdina\OneDrive - CZU v Praze\MAREK\Arbonaut\Projekty\DeadTrees-Metsakeskus\00PointClouds\keke.txt")
 
 ###Run GUI###
 if __name__ == '__main__':
