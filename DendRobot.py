@@ -4245,6 +4245,4 @@ def DetectDeadStandingTrees(inputcloud,):
 ###Run GUI###
 if __name__ == '__main__':
     mp.freeze_support()
-    # cloud = CropCloudByExtent(r"D:\MarekHrdina\OneDrive - CZU v Praze\MAREK\CZU\Projekty\Mapry\Lesicek\00MLS-ZEB\ScanA\MapryZEBtotls.laz", r"D:\MarekHrdina\OneDrive - CZU v Praze\MAREK\CZU\Projekty\Mapry\Lesicek\01GIS\polygon_mesh.ply")
-    # SavePointCloud(cloud, r"D:\MarekHrdina\OneDrive - CZU v Praze\MAREK\CZU\Projekty\Mapry\Lesicek\00MLS-ZEB\ScanA\MapryZEBtotlsCROP.laz")
     DendRobotGUI() 
