@@ -4151,7 +4151,15 @@ def SubtractRasters(raster1_path, raster2_path, output_path, epsg=32633, shiftby
     return result_data
 
 @timedone
-def WatershedCrownDelineation(rastertif, mintreeheight=5, smoothing_sigma=4, peak_local_max_footprint=(20, 20), epsg=32633):
+def WatershedCrownDelineation(
+    rastertif,
+    mintreeheight=5,
+    smoothing_sigma=1,
+    peak_local_max_footprint=(10, 10),
+    epsg=32633,
+    output_path=None,
+    save_result=True,
+):
     """Delineate tree crowns via watershed segmentation without seed points.
 
     Parameters
@@ -4166,6 +4174,12 @@ def WatershedCrownDelineation(rastertif, mintreeheight=5, smoothing_sigma=4, pea
         Window size for local maxima detection. Defaults to ``(20, 20)``.
     epsg : int, optional
         EPSG code assigned to the output shapefile. Defaults to ``32633``.
+    output_path : str or None, optional
+        Optional path override for the shapefile. Defaults to ``TreeCrowns.shp`` next to
+        ``rastertif`` when ``save_result`` is ``True``.
+    save_result : bool, optional
+        Whether to write the computed polygons to disk. Defaults to ``True`` to preserve the
+        legacy behaviour.
     """
     def close_holes(image, fill_value=0):
         filled_image = image.copy()
@@ -4206,20 +4220,24 @@ def WatershedCrownDelineation(rastertif, mintreeheight=5, smoothing_sigma=4, pea
     values = [value for geom, value in shapes_list if value != 0]
 
     # Prepare output shapefile with polygon areas
-    output_shapefile = os.path.join(os.path.dirname(rastertif), "TreeCrowns.shp") #os.path.splitext(os.path.basename(rastertif))[0] + "_TreeCrowns.shp")
-    schema = {
-        'geometry': 'Polygon',
-        'properties': {'CrownID': 'int', 'Area': 'float'}
-    }
-    with fiona.open(output_shapefile, 'w', driver='ESRI Shapefile', crs=CRS.from_epsg(epsg), schema=schema) as shp:
-        for poly, value in zip(polygons, values):
-            shp.write({
-                'geometry': mapping(poly),
-                'properties': {
-                    'CrownID': int(value),
-                    'Area': poly.area  # Calculate polygon area
-                }
-            })
+    if save_result:
+        output_shapefile = output_path or os.path.join(os.path.dirname(rastertif), "TreeCrowns.shp")
+        schema = {
+            'geometry': 'Polygon',
+            'properties': {'CrownID': 'int', 'Area': 'float'}
+        }
+        target_dir = os.path.dirname(output_shapefile)
+        if target_dir and not os.path.isdir(target_dir):
+            os.makedirs(target_dir, exist_ok=True)
+        with fiona.open(output_shapefile, 'w', driver='ESRI Shapefile', crs=CRS.from_epsg(epsg), schema=schema) as shp:
+            for poly, value in zip(polygons, values):
+                shp.write({
+                    'geometry': mapping(poly),
+                    'properties': {
+                        'CrownID': int(value),
+                        'Area': poly.area  # Calculate polygon area
+                    }
+                })
 
     #print(f"[{TimeNow()}] {inspect.currentframe().f_code.co_name}: Done.")
     return labels, polygons
@@ -5043,7 +5061,7 @@ def AssignPointsToTrees3D(
 
 ###MAIN###
 @MeasureProcessingTime
-def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segmentate=False, debug=False, rasterizestep=1, XSectionThickness=0.07, XSectionCount=3, XSectionStep=1, RANSACn=DEFAULT_RANSAC_ITERATIONS, RANSACd=DEFAULT_RANSAC_OUTLIER_THRESHOLD, WATERSHEDminheight=DEFAULT_WATERSHED_MIN_HEIGHT, dbhlimit=1.5, subsamplestep=0.05, chunksize=10, segmentationgap=0.05, segmentationminheight=DEFAULT_SEGMENTATION_MIN_HEIGHT, datatype="MLS/TLS Raw", keepfields="xyz", outpcdformat="txt"):
+def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segmentate=False, debug=False, rasterizestep=1, XSectionThickness=0.07, XSectionCount=3, XSectionStep=1, RANSACn=DEFAULT_RANSAC_ITERATIONS, RANSACd=DEFAULT_RANSAC_OUTLIER_THRESHOLD, WATERSHEDminheight=DEFAULT_WATERSHED_MIN_HEIGHT, dbhlimit=1.5, subsamplestep=0.05, chunksize=10, segmentationgap=0.05, segmentationminheight=DEFAULT_SEGMENTATION_MIN_HEIGHT, datatype="MLS/TLS Raw", keepfields="xyz", outpcdformat="laz"):
         """Run the full plot-processing pipeline: cleaning, disc fitting, and metric export.
 
         Parameters
@@ -5259,7 +5277,7 @@ def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segment
                 check_stop()
                 chm = _timed_call("SubtractRasters", SubtractRasters, os.path.join(folder, "DSM.tif"), os.path.join(folder, "DTM.tif"), os.path.join(folder, "CHM.tif"), epsg=epsg) #10 #Making CHM by subtracting DSM and DTM
                 check_stop()
-                _timed_call("WatershedCrownDelineation", WatershedCrownDelineation, rastertif=os.path.join(folder,"CHM.tif"), mintreeheight=WATERSHEDminheight, epsg=epsg, smoothing_sigma=1, peak_local_max_footprint=(20,20)) #11 #Finding tree crowns to use for crown area calculation and individual tree segmentation #Tweak
+                _timed_call("WatershedCrownDelineation", WatershedCrownDelineation, rastertif=os.path.join(folder,"CHM.tif"), mintreeheight=WATERSHEDminheight, epsg=epsg, smoothing_sigma=1, peak_local_max_footprint=(10,10)) #11 #Finding tree crowns to use for crown area calculation and individual tree segmentation #Tweak
             check_stop()
             
             flat = _timed_call("FlattenPointCloud", FlattenPointCloud, cloud, outputdir=debugdir, shiftby=shiftby, outpcdformat=outpcdformat) #12 #Flattening the point cloud to later detect tree stems
@@ -5670,7 +5688,7 @@ def DendRobotGUI():
     additional_paths_tree = None
     additional_paths_hint = None
     additional_item_data = {}
-    MAX_ADDITIONAL_PATHS = 99  # Keep the total number of point clouds in line with previous limit
+    MAX_ADDITIONAL_PATHS = 999
     ADDITIONAL_PANEL_WIDTH = 460
     ADDITIONAL_PANEL_HEIGHT = 220
     WINDOW_PADDING = 0
@@ -5679,6 +5697,70 @@ def DendRobotGUI():
     processing_thread = None
     orig_stdout = sys.stdout
     orig_stderr = sys.stderr
+
+    class LoadingScreen:
+        """Small splash screen shown while the main GUI widgets initialize."""
+
+        def __init__(self, master, message="Loading DendRobot GUI..."):
+            self.master = master
+            self.window = tk.Toplevel(master)
+            self.window.withdraw()
+            self.window.overrideredirect(True)
+            self.window.configure(bg="#1b1b1b")
+            try:
+                self.window.attributes("-topmost", True)
+            except tk.TclError:
+                pass
+
+            self.message_var = tk.StringVar(master=self.window, value=message)
+            label = tk.Label(
+                self.window,
+                textvariable=self.message_var,
+                font=("Segoe UI", 12, "bold"),
+                fg="#f2f2f2",
+                bg="#1b1b1b",
+                padx=30,
+                pady=15,
+            )
+            label.pack(fill=tk.BOTH, expand=True)
+
+            self.progress = ttk.Progressbar(self.window, mode="indeterminate", length=220)
+            self.progress.pack(fill=tk.X, padx=20, pady=(0, 18))
+
+            self.window.update_idletasks()
+            self._center()
+            self.window.deiconify()
+            self.progress.start(12)
+
+        def _center(self):
+            w = self.window.winfo_width()
+            h = self.window.winfo_height()
+            screen_w = self.master.winfo_screenwidth()
+            screen_h = self.master.winfo_screenheight()
+            x = int((screen_w - w) / 2)
+            y = int((screen_h - h) / 2)
+            self.window.geometry(f"{w}x{h}+{x}+{y}")
+
+        def update_message(self, message):
+            self.message_var.set(message)
+            self.window.update_idletasks()
+
+        def close(self):
+            try:
+                self.progress.stop()
+            except tk.TclError:
+                pass
+            try:
+                self.window.destroy()
+            except tk.TclError:
+                pass
+
+    root = TkinterDnD.Tk() if dnd_available else tk.Tk()
+    root.withdraw()
+    try:
+        loading_screen = LoadingScreen(root)
+    except tk.TclError:
+        loading_screen = None
 
     console_logs = []
     console_window = None
@@ -6116,6 +6198,12 @@ def DendRobotGUI():
             datatype = datatype_menu.get()
             dbhlim = float(maxdbh_spinbox.get())
             chunksize = float(chunksize_spinbox.get())
+            format_choice = outpcdformat_var.get().strip() if debug else ".laz"
+            if format_choice.startswith("."):
+                format_choice = format_choice[1:]
+            if not format_choice:
+                format_choice = "laz"
+            format_choice = format_choice.lower()
         except Exception as e:
             enqueue_ui(status_label.config, text=f"Invalid Parameter Values: {str(e)}")
             return
@@ -6162,6 +6250,7 @@ def DendRobotGUI():
                     datatype=datatype,
                     dbhlimit=dbhlim,
                     chunksize=chunksize,
+                    outpcdformat=format_choice,
                 )
 
                 processing_time = time.time() - start_time  # Calculate the duration
@@ -7057,8 +7146,637 @@ def DendRobotGUI():
             failure_callback=on_failure,
         )
 
+    class WatershedDialog(tk.Toplevel):
+        """Interactive dialog with live preview for crown delineation."""
+
+        PREVIEW_MAX_DIM = 800
+        PREVIEW_THUMB_SIZE = 420
+
+        def __init__(self, master):
+            super().__init__(master)
+            self.title("Watershed Crown Delineation")
+            self.resizable(True, True)
+            self.transient(master)
+            self.grab_set()
+            self._closing = False
+
+            self.raster_var = tk.StringVar()
+            self.mintreeheight_var = tk.StringVar(value=str(DEFAULT_WATERSHED_MIN_HEIGHT))
+            self.sigma_var = tk.StringVar(value="1")
+            self.footprint_x_var = tk.StringVar(value="10")
+            self.footprint_y_var = tk.StringVar(value="10")
+            self.epsg_var = tk.StringVar(value="32633")
+            self.save_path_var = tk.StringVar()
+            self.status_var = tk.StringVar(value="Select a canopy-height raster to begin.")
+
+            self._preview_after_id = None
+            self._pending_preview = False
+            self._preview_running = False
+            self._preview_thread = None
+            self._last_preview_labels = None
+            self._last_preview_raster = None
+            self._preview_image_full = None
+            self._last_epsg_source = None
+            self.preview_zoom = tk.DoubleVar(value=100.0)
+            self.zoom_label_var = tk.StringVar(value="100%")
+            self._pan_offset = [0.0, 0.0]
+            self._pan_drag_start = None
+            self.preview_canvas_image_id = None
+            self.preview_canvas_message_id = None
+
+            self._build_widgets()
+            self._attach_traces()
+            self.protocol("WM_DELETE_WINDOW", self.close)
+            self.focus_set()
+
+            # Lock the initial dialog geometry so it does not auto-resize when long paths are inserted.
+            self.update_idletasks()
+            locked_w = self.winfo_width()
+            locked_h = self.winfo_height()
+            if locked_w and locked_h:
+                self.geometry(f"{locked_w}x{locked_h}")
+                self.minsize(locked_w, locked_h)
+
+        def _build_widgets(self):
+            main = ttk.Frame(self)
+            main.pack(fill=tk.BOTH, expand=True)
+            main.columnconfigure(1, weight=1)
+            main.rowconfigure(0, weight=1)
+
+            form = ttk.Frame(main)
+            form.grid(row=0, column=0, sticky="nsw", padx=10, pady=10)
+
+            preview = ttk.Frame(main)
+            preview.grid(row=0, column=1, sticky="nsew", padx=(0, 10), pady=10)
+            preview.columnconfigure(0, weight=1)
+            preview.rowconfigure(1, weight=1)
+
+            ttk.Label(form, text="Canopy height raster:").grid(row=0, column=0, sticky="w")
+            raster_entry = ttk.Entry(form, textvariable=self.raster_var, width=40)
+            raster_entry.grid(row=0, column=1, sticky="ew", padx=(5, 5))
+            ttk.Button(form, text="Browse…", command=self._browse_raster).grid(row=0, column=2, sticky="ew")
+
+            ttk.Label(form, text="Min tree height (m):").grid(row=1, column=0, sticky="w", pady=(8, 0))
+            ttk.Entry(form, textvariable=self.mintreeheight_var, width=10).grid(row=1, column=1, sticky="w", pady=(8, 0))
+
+            ttk.Label(form, text="Smoothing sigma:").grid(row=2, column=0, sticky="w", pady=(8, 0))
+            ttk.Entry(form, textvariable=self.sigma_var, width=10).grid(row=2, column=1, sticky="w", pady=(8, 0))
+
+            ttk.Label(form, text="Peak window (px):").grid(row=3, column=0, sticky="w", pady=(8, 0))
+            footprint_frame = ttk.Frame(form)
+            footprint_frame.grid(row=3, column=1, sticky="w", pady=(8, 0))
+            ttk.Entry(footprint_frame, textvariable=self.footprint_x_var, width=6).pack(side=tk.LEFT)
+            ttk.Label(footprint_frame, text="×").pack(side=tk.LEFT, padx=2)
+            ttk.Entry(footprint_frame, textvariable=self.footprint_y_var, width=6).pack(side=tk.LEFT)
+
+            ttk.Label(form, text="EPSG code:").grid(row=4, column=0, sticky="w", pady=(8, 0))
+            ttk.Entry(form, textvariable=self.epsg_var, width=10).grid(row=4, column=1, sticky="w", pady=(8, 0))
+
+            button_frame = ttk.Frame(form)
+            button_frame.grid(row=5, column=0, columnspan=3, pady=(15, 0), sticky="ew")
+            self.save_button = ttk.Button(button_frame, text="Save", command=self._save_result, state=tk.DISABLED)
+            self.save_button.pack(side=tk.LEFT)
+            ttk.Button(button_frame, text="Close", command=self.close).pack(side=tk.LEFT, padx=10)
+
+            header = ttk.Frame(preview)
+            header.grid(row=0, column=0, sticky="ew")
+            header.columnconfigure(0, weight=1)
+            ttk.Label(header, text="Live preview").grid(row=0, column=0, sticky="w")
+            ttk.Label(header, textvariable=self.zoom_label_var).grid(row=0, column=1, sticky="e")
+
+            self.preview_canvas = tk.Canvas(
+                preview,
+                bg="black",
+                highlightthickness=1,
+                relief="sunken",
+                width=520,
+                height=360,
+            )
+            self.preview_canvas.grid(row=1, column=0, sticky="nsew", pady=5)
+            self.preview_canvas_message_id = self.preview_canvas.create_text(
+                0,
+                0,
+                text="Preview will appear here.",
+                fill="white",
+                font=("Segoe UI", 11),
+                width=320,
+            )
+            self.preview_canvas.bind("<Configure>", self._on_preview_canvas_configure)
+            self.preview_canvas.bind("<MouseWheel>", self._on_canvas_mousewheel)
+            self.preview_canvas.bind("<Button-4>", lambda e: self._on_canvas_mousewheel(e, delta=120))
+            self.preview_canvas.bind("<Button-5>", lambda e: self._on_canvas_mousewheel(e, delta=-120))
+            self.preview_canvas.bind("<ButtonPress-1>", self._start_pan)
+            self.preview_canvas.bind("<B1-Motion>", self._drag_pan)
+            self.preview_canvas.bind("<ButtonRelease-1>", self._stop_pan)
+
+            self.preview_info = ttk.Label(preview, text="", anchor="w")
+            self.preview_info.grid(row=2, column=0, sticky="w")
+            ttk.Label(preview, textvariable=self.status_var, wraplength=320, justify="left").grid(row=3, column=0, sticky="ew", pady=(5, 0))
+
+        def _attach_traces(self):
+            watched = (
+                self.mintreeheight_var,
+                self.sigma_var,
+                self.footprint_x_var,
+                self.footprint_y_var,
+                self.epsg_var,
+            )
+            for var in watched:
+                var.trace_add("write", self.schedule_preview_update)
+
+            self.raster_var.trace_add("write", self._on_raster_var_changed)
+
+        def _on_raster_var_changed(self, *args):
+            self.schedule_preview_update()
+            self._maybe_update_epsg_from_raster()
+
+        def _maybe_update_epsg_from_raster(self):
+            path = self.raster_var.get().strip()
+            if not path or not os.path.exists(path):
+                return
+            if self._last_epsg_source == path:
+                return
+            try:
+                with rasterio.open(path) as src:
+                    crs = src.crs
+                    epsg = crs.to_epsg() if crs else None
+            except Exception:
+                return
+            if epsg:
+                self._last_epsg_source = path
+                self.epsg_var.set(str(epsg))
+        def _browse_raster(self):
+            filename = filedialog.askopenfilename(
+                parent=self,
+                title="Select raster",
+                filetypes=[("GeoTIFF", "*.tif *.tiff"), ("All files", "*.*")],
+            )
+            if filename:
+                self.raster_var.set(os.path.normpath(filename))
+
+        def schedule_preview_update(self, *args):
+            if self._closing:
+                return
+            if self._preview_after_id:
+                try:
+                    self.after_cancel(self._preview_after_id)
+                except tk.TclError:
+                    self._preview_after_id = None
+                    return
+            self._preview_after_id = self.after(500, self._queue_preview)
+
+        def _queue_preview(self):
+            self._preview_after_id = None
+            if self._closing:
+                return
+            self._pending_preview = True
+            if not self._preview_running:
+                self._start_preview_run()
+
+        def _start_preview_run(self):
+            if self._closing:
+                return
+            self._pending_preview = False
+            try:
+                params = self._collect_params()
+            except ValueError as exc:
+                self._set_status(str(exc))
+                self._last_preview_labels = None
+                self._update_save_button_state()
+                return
+
+            self._preview_running = True
+            self._set_status("Updating preview…")
+            thread = threading.Thread(target=self._preview_worker, args=(params,), daemon=True)
+            self._preview_thread = thread
+            thread.start()
+
+        def _collect_params(self):
+            raster_path = self.raster_var.get().strip()
+            if not raster_path:
+                raise ValueError("Select a canopy-height raster to start.")
+            if not os.path.exists(raster_path):
+                raise ValueError("Raster path does not exist.")
+
+            def _parse_float(var, label, min_value=None):
+                text = var.get().strip().replace(",", ".")
+                if not text:
+                    raise ValueError(f"{label} is required.")
+                value = float(text)
+                if min_value is not None and value < min_value:
+                    raise ValueError(f"{label} must be ≥ {min_value}.")
+                return value
+
+            def _parse_int(var, label, min_value=1):
+                text = var.get().strip()
+                if not text:
+                    raise ValueError(f"{label} is required.")
+                value = int(text)
+                if value < min_value:
+                    raise ValueError(f"{label} must be ≥ {min_value}.")
+                return value
+
+            mintreeheight = _parse_float(self.mintreeheight_var, "Min tree height", 0.0)
+            smoothing_sigma = _parse_float(self.sigma_var, "Smoothing sigma", 0.0)
+            footprint_x = _parse_int(self.footprint_x_var, "Peak window width", 1)
+            footprint_y = _parse_int(self.footprint_y_var, "Peak window height", 1)
+            epsg = _parse_int(self.epsg_var, "EPSG code", 1000)
+
+            return {
+                "raster": os.path.normpath(raster_path),
+                "mintreeheight": mintreeheight,
+                "smoothing_sigma": smoothing_sigma,
+                "footprint": (footprint_x, footprint_y),
+                "epsg": epsg,
+            }
+
+        def _preview_worker(self, params):
+            try:
+                labels, _ = WatershedCrownDelineation(
+                    rastertif=params["raster"],
+                    mintreeheight=params["mintreeheight"],
+                    smoothing_sigma=params["smoothing_sigma"],
+                    peak_local_max_footprint=params["footprint"],
+                    epsg=params["epsg"],
+                    save_result=False,
+                )
+                base_raster = None
+                try:
+                    with rasterio.open(params["raster"]) as src:
+                        base_raster = src.read(1).astype(float)
+                except Exception:
+                    base_raster = None
+            except Exception as exc:
+                self._dispatch(lambda: self._handle_preview_error(exc))
+                return
+            self._dispatch(lambda: self._handle_preview_success(labels, base_raster))
+
+        def _dispatch(self, callback):
+            if self._closing:
+                return
+            try:
+                self.after(0, callback)
+            except tk.TclError:
+                pass
+
+        def _handle_preview_success(self, labels, raster_data):
+            if self._closing:
+                return
+            self._preview_running = False
+            self._last_preview_labels = labels
+            self._last_preview_raster = raster_data
+            self._render_preview(labels, raster_data)
+            crowns = int(np.max(labels)) if labels.size else 0
+            if crowns:
+                self._set_status(f"Preview updated - {crowns} crowns detected.")
+            else:
+                self._set_status("Preview updated - no crowns detected.")
+            self._update_save_button_state()
+            if self._pending_preview:
+                self._start_preview_run()
+
+        def _handle_preview_error(self, exc):
+            if self._closing:
+                return
+            self._preview_running = False
+            self._last_preview_labels = None
+            self._last_preview_raster = None
+            self._set_status(f"Preview failed: {exc}")
+            self._show_preview_message("Preview unavailable.")
+            self.preview_info.config(text="")
+            self._update_save_button_state()
+            if self._pending_preview:
+                self._start_preview_run()
+
+        def _render_preview(self, labels, base_data):
+            has_labels = labels is not None and labels.size
+            has_base = base_data is not None
+
+            if not has_labels and not has_base:
+                self.preview_info.config(text="")
+                self.preview_photo = None
+                self._preview_image_full = None
+                self._pan_offset = [0.0, 0.0]
+                self._show_preview_message("No preview available.")
+                return
+
+            if has_base and has_labels and base_data.shape != labels.shape:
+                # Shapes mismatch; drop base overlay to avoid distortion
+                has_base = False
+
+            preview_labels = labels if has_labels else None
+            preview_base = base_data if has_base else None
+
+            reference_shape = None
+            if preview_labels is not None:
+                reference_shape = preview_labels.shape
+            elif preview_base is not None:
+                reference_shape = preview_base.shape
+
+            step = 1
+            if reference_shape:
+                max_dim = max(reference_shape)
+                if max_dim > self.PREVIEW_MAX_DIM:
+                    step = max(1, math.ceil(max_dim / self.PREVIEW_MAX_DIM))
+                    if preview_labels is not None:
+                        preview_labels = preview_labels[::step, ::step]
+                    if preview_base is not None:
+                        preview_base = preview_base[::step, ::step]
+
+            overlay_rgb = None
+            crowns = 0
+            if preview_labels is not None and np.any(preview_labels):
+                labels_uint = np.asarray(preview_labels, dtype=np.uint32)
+                r = ((labels_uint * 123457) % 251).astype(np.uint8)
+                g = ((labels_uint * 354389) % 253).astype(np.uint8)
+                b = ((labels_uint * 74323) % 255).astype(np.uint8)
+                overlay_rgb = np.stack((r, g, b), axis=-1)
+                overlay_rgb[labels_uint == 0] = 0
+                if labels is not None and labels.size:
+                    crowns = int(np.max(labels))
+                else:
+                    crowns = int(np.max(preview_labels))
+
+            base_rgb = None
+            if preview_base is not None:
+                base = np.asarray(preview_base, dtype=np.float32)
+                mask = np.isfinite(base)
+                norm = np.zeros_like(base, dtype=np.float32)
+                if np.any(mask):
+                    vals = base[mask]
+                    vmin = float(np.percentile(vals, 5))
+                    vmax = float(np.percentile(vals, 95))
+                    if not np.isfinite(vmin):
+                        vmin = np.nanmin(vals)
+                    if not np.isfinite(vmax):
+                        vmax = np.nanmax(vals)
+                    if vmax - vmin < 1e-6:
+                        vmax = vmin + 1e-6
+                    norm[mask] = (base[mask] - vmin) / (vmax - vmin)
+                    np.clip(norm, 0, 1, out=norm)
+                gray = (norm * 255).astype(np.uint8)
+                base_rgb = np.repeat(gray[..., None], 3, axis=2)
+
+            if base_rgb is not None:
+                combined = base_rgb.astype(np.float32)
+                if overlay_rgb is not None:
+                    mask = preview_labels > 0
+                    if np.any(mask):
+                        overlay = overlay_rgb.astype(np.float32)
+                        alpha = 0.5
+                        combined[mask] = (1 - alpha) * combined[mask] + alpha * overlay[mask]
+                display_image = combined.astype(np.uint8)
+            elif overlay_rgb is not None:
+                display_image = overlay_rgb
+            else:
+                self.preview_info.config(text="")
+                self.preview_photo = None
+                self._preview_image_full = None
+                self._pan_offset = [0.0, 0.0]
+                self._show_preview_message("Preview unavailable.")
+                return
+
+            image = Image.fromarray(display_image, "RGB")
+            max_dim = max(image.size)
+            if max_dim > self.PREVIEW_MAX_DIM:
+                scale = self.PREVIEW_MAX_DIM / max_dim
+                new_size = (max(1, int(image.width * scale)), max(1, int(image.height * scale)))
+                image = image.resize(new_size, Image.NEAREST)
+
+            max_preview_dim = self.PREVIEW_THUMB_SIZE
+            max_dim_preview = max(image.size)
+            if max_dim_preview > max_preview_dim:
+                scale = max_preview_dim / max_dim_preview
+                new_size = (max(1, int(image.width * scale)), max(1, int(image.height * scale)))
+                image = image.resize(new_size, Image.NEAREST)
+
+            previous_zoom = float(self.preview_zoom.get()) if self._preview_image_full is not None else 100.0
+            previous_zoom = max(25.0, min(400.0, previous_zoom))
+            reset_pan = self._preview_image_full is None
+            self._preview_image_full = image
+            self.preview_zoom.set(previous_zoom)
+            self.zoom_label_var.set(f"{previous_zoom:.0f}%")
+            self._apply_preview_zoom(zoom=previous_zoom, reset_pan=reset_pan)
+
+            if labels is not None and labels.size:
+                h, w = labels.shape
+            elif base_data is not None:
+                h, w = base_data.shape
+            else:
+                h = w = 0
+            self.preview_info.config(text=f"Raster: {w} x {h} px  |  Crowns: {crowns}")
+
+        def _apply_preview_zoom(self, zoom=None, reset_pan=False):
+            if self._preview_image_full is None:
+                return
+            if zoom is None:
+                try:
+                    zoom = float(self.preview_zoom.get())
+                except (tk.TclError, ValueError):
+                    zoom = 100.0
+            zoom = max(25.0, min(400.0, zoom))
+            self.zoom_label_var.set(f"{zoom:.0f}%")
+
+            width = max(1, int(self._preview_image_full.width * zoom / 100.0))
+            height = max(1, int(self._preview_image_full.height * zoom / 100.0))
+            resample = Image.NEAREST if zoom >= 100 else Image.BILINEAR
+            resized = self._preview_image_full.resize((width, height), resample=resample)
+            self.preview_photo = ImageTk.PhotoImage(resized)
+            if reset_pan:
+                self._pan_offset = [0.0, 0.0]
+            if self.preview_canvas_image_id is None:
+                self.preview_canvas.update_idletasks()
+                canvas_w = max(1, self.preview_canvas.winfo_width())
+                canvas_h = max(1, self.preview_canvas.winfo_height())
+                self.preview_canvas_image_id = self.preview_canvas.create_image(
+                    canvas_w / 2,
+                    canvas_h / 2,
+                    image=self.preview_photo,
+                    anchor="center",
+                )
+            else:
+                self.preview_canvas.itemconfigure(self.preview_canvas_image_id, image=self.preview_photo, state="normal")
+            if self.preview_canvas_message_id is not None:
+                self.preview_canvas.itemconfigure(self.preview_canvas_message_id, state="hidden")
+            self._update_canvas_image_position()
+
+        def _on_canvas_mousewheel(self, event, delta=None):
+            if self._preview_image_full is None:
+                return
+            raw_delta = delta if delta is not None else getattr(event, "delta", 0)
+            if raw_delta == 0 and hasattr(event, "num"):
+                raw_delta = 120 if event.num == 4 else -120
+            if raw_delta == 0:
+                return
+            step = 10
+            direction = 1 if raw_delta > 0 else -1
+            new_zoom = self.preview_zoom.get() + direction * step
+            new_zoom = max(25.0, min(400.0, new_zoom))
+            if abs(new_zoom - self.preview_zoom.get()) < 0.1:
+                return
+            self.preview_zoom.set(new_zoom)
+            self.zoom_label_var.set(f"{new_zoom:.0f}%")
+            self._apply_preview_zoom(zoom=new_zoom, reset_pan=False)
+
+        def _start_pan(self, event):
+            if self.preview_photo is None:
+                return
+            self._pan_drag_start = (event.x, event.y)
+            self.preview_canvas.config(cursor="fleur")
+
+        def _drag_pan(self, event):
+            if self._pan_drag_start is None or self.preview_photo is None:
+                return
+            dx = event.x - self._pan_drag_start[0]
+            dy = event.y - self._pan_drag_start[1]
+            self._pan_drag_start = (event.x, event.y)
+            self._pan_offset[0] += dx
+            self._pan_offset[1] += dy
+            self._update_canvas_image_position()
+
+        def _stop_pan(self, event):
+            if self._pan_drag_start is None:
+                return
+            self._pan_drag_start = None
+            self.preview_canvas.config(cursor="")
+            self._update_canvas_image_position()
+
+        def _on_preview_canvas_configure(self, event):
+            if self.preview_canvas_message_id is not None:
+                self.preview_canvas.coords(self.preview_canvas_message_id, event.width / 2, event.height / 2)
+                self.preview_canvas.itemconfigure(self.preview_canvas_message_id, width=max(150, event.width - 40))
+            self._update_canvas_image_position()
+
+        def _show_preview_message(self, text):
+            if self.preview_canvas_message_id is not None:
+                self.preview_canvas.update_idletasks()
+                canvas_w = max(1, self.preview_canvas.winfo_width())
+                canvas_h = max(1, self.preview_canvas.winfo_height())
+                self.preview_canvas.coords(self.preview_canvas_message_id, canvas_w / 2, canvas_h / 2)
+                self.preview_canvas.itemconfigure(
+                    self.preview_canvas_message_id,
+                    text=text,
+                    state="normal",
+                    width=max(150, canvas_w - 40),
+                )
+            if self.preview_canvas_image_id is not None:
+                self.preview_canvas.itemconfigure(self.preview_canvas_image_id, state="hidden")
+
+        def _update_canvas_image_position(self):
+            if self.preview_canvas_image_id is None or self.preview_photo is None:
+                return
+            self.preview_canvas.update_idletasks()
+            canvas_w = max(1, self.preview_canvas.winfo_width())
+            canvas_h = max(1, self.preview_canvas.winfo_height())
+            img_w = self.preview_photo.width()
+            img_h = self.preview_photo.height()
+            max_offset_x = max(0, (img_w - canvas_w) / 2)
+            max_offset_y = max(0, (img_h - canvas_h) / 2)
+            self._pan_offset[0] = max(-max_offset_x, min(max_offset_x, self._pan_offset[0]))
+            self._pan_offset[1] = max(-max_offset_y, min(max_offset_y, self._pan_offset[1]))
+            cx = canvas_w / 2 + self._pan_offset[0]
+            cy = canvas_h / 2 + self._pan_offset[1]
+            self.preview_canvas.coords(self.preview_canvas_image_id, cx, cy)
+
+        def _update_save_button_state(self):
+            ready = (
+                not self._preview_running
+                and self._last_preview_labels is not None
+            )
+            self.save_button.config(state=tk.NORMAL if ready else tk.DISABLED)
+
+        def _save_result(self):
+            if self._preview_running:
+                return
+            try:
+                params = self._collect_params()
+            except ValueError as exc:
+                messagebox.showerror("Invalid input", str(exc), parent=self)
+                return
+
+            dialog_kwargs = {
+                "parent": self,
+                "title": "Save crown polygons",
+                "defaultextension": ".shp",
+                "filetypes": [("ESRI Shapefile", "*.shp"), ("All files", "*.*")],
+            }
+            last_path = self.save_path_var.get().strip()
+            if last_path:
+                last_dir = os.path.dirname(last_path) or os.getcwd()
+                if os.path.isdir(last_dir):
+                    dialog_kwargs["initialdir"] = last_dir
+                base = os.path.basename(last_path)
+                if base:
+                    dialog_kwargs["initialfile"] = base
+            else:
+                raster_dir = os.path.dirname(params["raster"])
+                if os.path.isdir(raster_dir):
+                    dialog_kwargs["initialdir"] = raster_dir
+                raster_basename = os.path.splitext(os.path.basename(params["raster"]))[0]
+                dialog_kwargs["initialfile"] = f"{raster_basename}_Watershed.shp"
+
+            save_path = filedialog.asksaveasfilename(**dialog_kwargs)
+            if not save_path:
+                self._set_status("Save cancelled.")
+                return
+
+            save_path = os.path.normpath(save_path)
+            self.save_path_var.set(save_path)
+
+            self._set_status("Saving shapefile…")
+            self.save_button.config(state=tk.DISABLED)
+
+            def _worker():
+                try:
+                    WatershedCrownDelineation(
+                        rastertif=params["raster"],
+                        mintreeheight=params["mintreeheight"],
+                        smoothing_sigma=params["smoothing_sigma"],
+                        peak_local_max_footprint=params["footprint"],
+                        epsg=params["epsg"],
+                        output_path=save_path,
+                    )
+                except Exception as exc:
+                    self._dispatch(lambda: self._on_save_failed(exc))
+                else:
+                    self._dispatch(lambda: self._on_save_finished(save_path))
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        def _on_save_finished(self, path):
+            if self._closing:
+                return
+            self._set_status(f"Saved shapefile to:\n{path}")
+            messagebox.showinfo("Watershed Crown Delineation", f"Polygons saved to:\n{path}", parent=self)
+            self._update_save_button_state()
+
+        def _on_save_failed(self, exc):
+            if self._closing:
+                return
+            self._set_status(f"Saving failed: {exc}")
+            messagebox.showerror("Watershed Crown Delineation", f"Saving failed:\n{exc}", parent=self)
+            self._update_save_button_state()
+
+        def _set_status(self, text):
+            self.status_var.set(text)
+
+        def close(self):
+            self._closing = True
+            if self._preview_after_id:
+                try:
+                    self.after_cancel(self._preview_after_id)
+                except tk.TclError:
+                    pass
+                self._preview_after_id = None
+            self.destroy()
+
+    def open_watershed_dialog():
+        try:
+            WatershedDialog(root)
+        except Exception as exc:
+            messagebox.showerror("Watershed Crown Delineation", f"Could not open dialog:\n{exc}")
+
     # Create the GUI window
-    root = TkinterDnD.Tk() if dnd_available else tk.Tk()
     root.after(50, process_ui_queue)
     root.title("DendRobot v0.5")
 
@@ -7145,6 +7863,7 @@ def DendRobotGUI():
     functions_menu = tk.Menu(menubar, tearoff=False)
     functions_menu.add_command(label="Map Scalar Fields", command=map_scalar_fields_dialog)
     functions_menu.add_command(label="Crop Cloud by Extent", command=crop_by_extent_dialog)
+    functions_menu.add_command(label="Watershed Crown Delineation", command=open_watershed_dialog)
     menubar.add_cascade(label="Functions", menu=functions_menu)
 
 
@@ -7311,6 +8030,27 @@ def DendRobotGUI():
     debug_checkbox.grid(row=1, column=2, padx=10, pady=5, sticky="s")
     create_tooltip(debug_label, "The outputs will contain most of the intermediate files from processing steps.")  # Attach tooltip to the label
 
+    FORMAT_CHOICES = [".laz", ".txt"]
+    outpcdformat_var = tk.StringVar(value=".laz")
+    debug_format_menu = ttk.Combobox(
+        options_frame,
+        textvariable=outpcdformat_var,
+        values=FORMAT_CHOICES,
+        state="readonly",
+        width=3,
+    )
+    debug_format_menu.grid(row=2, column=2, padx=10, pady=(0, 5), sticky="n")
+    create_tooltip(
+        debug_format_menu,
+        "Output format for debug point clouds. Active only when Debug is enabled.",
+    )
+
+    def update_debug_controls(*args):
+        state = "readonly" if debug_var.get() else tk.DISABLED
+        debug_format_menu.configure(state=state)
+
+    debug_var.trace_add("write", update_debug_controls)
+    update_debug_controls()
 
     # Horizontal black line (separator) under the Advanced Mode checkbox
     separator = tk.Frame(content, height=2, bd=1, relief="sunken", bg="black")
@@ -7582,6 +8322,11 @@ def DendRobotGUI():
     expanded_window_geometry = f"{expanded_window_width}x{initial_height}"
 
     root.geometry(initial_window_geometry)
+
+    if loading_screen:
+        loading_screen.update_message("Ready.")
+        loading_screen.close()
+    root.deiconify()
 
     root.after(0, _sync_scrollbars)
 
