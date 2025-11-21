@@ -17,20 +17,20 @@ The input parameters should be adjusted according to the specific input data, ei
 
 | Parameter Name               | Type    | Recommended Range                          | Default Value | Meaning |
 |------------------------------|---------|--------------------------------------------|--------------|---------|
-| Point Cloud Data Path        | String  | N/A                                        | None         | Path of a point cloud file to be processed. |
-| Debug                        | Boolean | True / False                               | False        | If set to True, intermediate files at each processing step will be generated and saved to the computer. |
-| Segmentate                        | Boolean | True / False                               | False        | If set to True, individual trees will be extracted from the input point cloud and saved into a comprehensive file. Individual tree crown projections will also be saved as a separate shapefile. Use together with Debug, to save dropped points too. |
+| Point Cloud Data Path        | String  | N/A                                        | None         | Path of a point cloud file to be processed. Multiple paths can be provided. |
+| Debug                        | Boolean | True / False                               | False        | If set to True, intermediate files at each processing step will be generated and saved to the computer. Intermediate point clouds can be stored in either “.txt” or “.laz” formats. |
+| Segmentate                        | Boolean | True / False                               | False        | If set to True, individual trees will be extracted from the input point cloud and saved into a comprehensive point cloud file. Individual tree crown projections will also be saved as a separate shapefile. Use together with Debug, to save unclassified points too. |
 | EPSG Code                    | Integer | Projected Coordinate Systems only          | 32633        | If the point cloud is georeferenced, the processing outputs will be assigned the specified EPSG code. |
-| Data Type                    | String  | 'MLS Raw'; 'MLS Cropped'; 'iPhone LiDAR'; 'CRP'; 'UAV LiDAR' | 'MLS Raw'  | The source of the point cloud. Based on the selected option, other parameters will be adjusted to more appropriate default values, and the processing algorithm will vary accordingly. |
+| Data Type                    | String  | 'MLS Raw'; 'MLS Cropped'; 'iPhone LiDAR'; 'CRP'; 'UAV LiDAR'; ‘ALS (1000 pts/m^2)’ | 'MLS Raw'  | The source of the point cloud. Based on the selected option, other parameters will be adjusted to more appropriate default values, and the processing algorithm will vary accordingly. |
 | Maximal DBH                 | Float   | 0.1 to 5                                   | 1.5          | A threshold for filtering out trees with unrealistic DBH estimate. |
-| Subsampling Step             | Float   | 0.01 to 0.2                                | 0.05         | The minimum step size between points in the subsampled point cloud. |
+| Subsampling Step             | Float   | 0.01 to 0.2                                | 0.05         | The minimum step size between points in the subsampled point cloud created during initial processing steps.|
 | Filter-Chunk Size            | Float   | 1 to 100                                   | 10           | The sensitivity of density filtering to smaller objects. Higher values result in detecting only larger trees, whereas excessively low values may lead to improper terrain removal. |
 | DTM Resolution               | Float   | 0.5 to 5                                   | 1            | The grid step for detecting minima within each grid cell. The DSM is generated at four times finer resolution. |
 | Segmentation Gap            | Float   | 0.01 to 1                                | 0.05         | The spatial gap which is used for filtering non-tree objects. The lower, the more reliable segmentation, but larger potential loss of details. |
 | Segmentation Min Height            | Float   | 0.01 to 1                                | 0.05         | Points below this height above the terrain are ignored during segmentation to reduce ground artefacts. Use lower values only if there is not any undergrowth.|
 | Cross Section Thickness      | Float   | 0.01 to 1.0                                | 0.07         | The size of the cross-section, which will later be used for RANSAC Circle Fitting. |
 | Cross Sections Count         | Integer | 1 to Any                                     | 3            | The number of cross-sections extracted for each tree, which will be used for RANSAC Circle Fitting. |
-| Cross Section Step      | Float   | 0.1 to 1.0                                | 1         | Determines how far from each other the cross-sections will be made. |
+| Cross Section Step      | Float   | 0.1 to 1.0                                | 1         | Determines how far from each other the cross-sections will be made. The first cross–section is always made at 1.3 m above terrain. |
 
 
 
