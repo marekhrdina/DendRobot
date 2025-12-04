@@ -63,4 +63,3 @@ Marek Hrdina¹\*
 Kamýcká 129, 16500 Prague, Czech Republic  
 
 \* **Corresponding author:** [hrdinam@fld.czu.cz](mailto:hrdinam@fld.czu.cz)
-
