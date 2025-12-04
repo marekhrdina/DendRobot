@@ -1029,7 +1029,7 @@ def FitCircleRANSAC(input_data, n=1000, d=0.01):
     yc = float(yc_rel + centroid[1])
     return xc, yc, radius, float(best_error)
 
-def process_fit_cross_section(disc, RANSACn, RANSACd, CCfinestep, ptsfilter, datatype, XSectionThickness, segmentate):
+def process_fit_cross_section(disc, RANSACn, RANSACd, CCfinestep, ptsfilter, datatype, XSectionThickness, segmentation):
     """Clean a single disc slice and fit a circle returning augmented attributes.
 
     Parameters
@@ -1047,9 +1047,9 @@ def process_fit_cross_section(disc, RANSACn, RANSACd, CCfinestep, ptsfilter, dat
     datatype : str
         Input data classification controlling verticality and SOR parameters.
     XSectionThickness : float
-        Slice thickness used when "datatype" corresponds to UAV LiDAR.
-    segmentate : bool
-        ``True`` to compute a concave hull perimeter for segmentated crowns.
+        Slice thickness used when "datatype" corresponds to UAV LiDAR or ALS (1000 pts/m^2).
+    segmentation : bool
+        ``True`` to compute a concave hull perimeter for segmentationd crowns.
 
     Returns
     -------
@@ -1065,7 +1065,7 @@ def process_fit_cross_section(disc, RANSACn, RANSACd, CCfinestep, ptsfilter, dat
     if datatype in ("MLS Raw", "MLS Cropped", "CRP", "iPhone LiDAR"):
         vradius = 0.05
         sornpoints = 12
-    elif datatype == "UAV LiDAR":
+    elif datatype in ("UAV LiDAR", "ALS (1000 pts/m^2)"):
         vradius = XSectionThickness
         sornpoints = 3
     else:
@@ -1073,7 +1073,7 @@ def process_fit_cross_section(disc, RANSACn, RANSACd, CCfinestep, ptsfilter, dat
         sornpoints = 12
 
     try:
-        if segmentate:
+        if segmentation:
             xy = disc[:, :2]
             hullperimeter = concave_hull_perimeter(xy)
         else:
@@ -1103,7 +1103,7 @@ def FitCrossSections(
     ptsfilter,
     datatype,
     XSectionThickness,
-    segmentate,
+    segmentation,
     prefer_threads=True,
 ):
     """Fit circles on each cross-sectional disc using Numba-accelerated kernels.
@@ -1124,7 +1124,7 @@ def FitCrossSections(
         Input data classification controlling downstream filtering heuristics.
     XSectionThickness : float
         Thickness of the slicing window used when ``datatype`` requires it.
-    segmentate : bool
+    segmentation : bool
         When ``True`` computes concave hull perimeters for each disc.
     prefer_threads : bool, optional
         Retained for backwards compatibility; has no effect in the new implementation.
@@ -1150,7 +1150,7 @@ def FitCrossSections(
         ptsfilter=ptsfilter,
         datatype=datatype,
         XSectionThickness=XSectionThickness,
-        segmentate=segmentate,
+        segmentation=segmentation,
     )
 
     _ = prefer_threads  # compatibility placeholder; no effect in the current implementation
@@ -3099,7 +3099,7 @@ def RemoveField(input_data, field_index=-1):
     else:
         raise TypeError("Input data must be a NumPy array or Pandas DataFrame.")
 
-def SavePointCloud(input_data, savepath, fields="all", shiftby = [0,0,0]):
+def SavePointCloud(input_data, savepath, fields="all", shiftby=[0, 0, 0]):
     """Persist a point cloud in the format implied by ``savepath``.
 
     Parameters
@@ -3113,6 +3113,7 @@ def SavePointCloud(input_data, savepath, fields="all", shiftby = [0,0,0]):
     shiftby : Sequence[float], optional
         XYZ translation applied before writing. Defaults to ``[0, 0, 0]``.
     """
+    # --- Resolve shiftby (including optional global default) ---
     if shiftby is None:
         global_shift = globals().get("shiftby")
         shiftby = global_shift if global_shift not in (None, []) else [0, 0, 0]
@@ -3122,77 +3123,179 @@ def SavePointCloud(input_data, savepath, fields="all", shiftby = [0,0,0]):
     elif shiftby.size > 3:
         shiftby = shiftby[:3]
 
-    input_data = LoadPointCloud(input_data, "np", fields = fields)  # Ensure input_data is a DataFrame
-    # Create a copy to avoid modifying the original data
-    #input_data = input_data.copy()
-
-    # Apply shifting to x and y coordinates
+    # --- Load input as numpy array ---
+    input_data = LoadPointCloud(input_data, "np", fields=fields)
     input_data = np.array(input_data, dtype="float64")
+
+    # --- Apply XYZ shift ---
     input_data[:, :3] = input_data[:, :3] + shiftby
-    # input_data[:, 0] += shiftby[0]  # Shift x #######
-    # input_data[:, 1] += shiftby[1]  # Shift y
-    # input_data[:, 2] += shiftby[2]  # Shift z
+    pts = input_data[:, :3]
 
-    # Detect file extension and infer format
+    # --- Guard against corrupted / padded / NaN rows ---
+    bad_mask = ~np.isfinite(pts).all(axis=1)
+    if input_data.shape[1] > 3:
+        bad_mask |= ~np.isfinite(input_data[:, 3:]).all(axis=1)
+
+    if np.all(np.isfinite(shiftby)):
+        xy_at_shift = (
+            np.isclose(pts[:, 0], shiftby[0], atol=1e-6, rtol=0.0)
+            & np.isclose(pts[:, 1], shiftby[1], atol=1e-6, rtol=0.0)
+        )
+        z_far = np.abs(pts[:, 2] - shiftby[2]) > 1_000.0
+        padded_rows = xy_at_shift & z_far
+        bad_mask |= padded_rows
+
+    if np.any(bad_mask):
+        dropped = int(bad_mask.sum())
+        warnings.warn(
+            f"SavePointCloud: dropped {dropped} rows with invalid or padded values before write.",
+            RuntimeWarning,
+        )
+        input_data = input_data[~bad_mask]
+        pts = input_data[:, :3]
+
+    # --- Robust axis guards to kill crazy outliers that would ruin scales/offsets ---
+    if pts.shape[0]:
+        finite_mask = np.isfinite(pts).all(axis=1)
+        pts_finite = pts[finite_mask]
+        if pts_finite.size:
+            q1 = np.percentile(pts_finite, 25, axis=0)
+            q3 = np.percentile(pts_finite, 75, axis=0)
+            iqr = q3 - q1
+            # Allow generous spread: at least 1 m in XY and 50 m in Z, or 5*IQR
+            min_tols = np.array([1.0, 1.0, 50.0], dtype=np.float64)
+            tol = np.maximum(5.0 * iqr, min_tols)
+            lo = q1 - tol
+            hi = q3 + tol
+            mask_axes = (
+                (pts[:, 0] >= lo[0]) & (pts[:, 0] <= hi[0]) &
+                (pts[:, 1] >= lo[1]) & (pts[:, 1] <= hi[1]) &
+                (pts[:, 2] >= lo[2]) & (pts[:, 2] <= hi[2])
+            )
+            if not np.all(mask_axes):
+                dropped = int((~mask_axes).sum())
+                warnings.warn(
+                    f"SavePointCloud: dropped {dropped} rows outside robust XYZ ranges "
+                    f"[{lo[0]:.2f},{hi[0]:.2f}]x[{lo[1]:.2f},{hi[1]:.2f}]x[{lo[2]:.2f},{hi[2]:.2f}].",
+                    RuntimeWarning,
+                )
+                input_data = input_data[mask_axes]
+                pts = input_data[:, :3]
+
+    if input_data.size == 0:
+        raise ValueError("SavePointCloud: no valid points remain after filtering.")
+
+    # --- Detect file extension and infer format ---
     _, file_extension = os.path.splitext(savepath)
-    format = file_extension.lower()[1:]  # Remove the leading dot
+    format = file_extension.lower()[1:]  # Remove leading dot
 
-    if format in ["ply", "pcd", "pts", "xyzn", "xyzrgb"]: #WARNING: this if doesnt work #######
-        # Convert DataFrame to Open3D PointCloud
+    # =======================================================================
+    # 1) Generic point-based formats via Open3D
+    # =======================================================================
+    if format in ["ply", "pcd", "pts", "xyzn", "xyzrgb"]:
         point_cloud = o3d.geometry.PointCloud()
         points = input_data[:, :3]
-        point_cloud.points = o3d.utility.Vector3dVector(points)  # Use x, y, z columns
+        point_cloud.points = o3d.utility.Vector3dVector(points)
 
-        if input_data.shape[1] >= 6:  # Assuming 4th, 5th, and 6th columns are RGB
-            colors = input_data[:, 3:6] / 255.0  # Normalize to [0, 1]
-            point_cloud.colors = o3d.utility.Vector3dVector(colors) 
+        if input_data.shape[1] >= 6:
+            # Treat columns 3:6 as RGB in [0,255] if present
+            colors = input_data[:, 3:6] / 255.0
+            point_cloud.colors = o3d.utility.Vector3dVector(colors)
 
         o3d.io.write_point_cloud(savepath, point_cloud)
 
-    elif format in ["txt", "xyz", "asc"]: #######
-        # Save as space-delimited text including all fields 
+    # =======================================================================
+    # 2) Simple text formats
+    # =======================================================================
+    elif format in ["txt", "xyz", "asc"]:
         np.savetxt(savepath, input_data, fmt='%f', delimiter=' ')
 
-    elif format in ["las", "laz"]: #######
+    # =======================================================================
+    # 3) LAS / LAZ – adaptive high-precision scaling, universal extra dims
+    # =======================================================================
+    elif format in ["las", "laz"]:
         try:
-            # Ensure the first three columns are x, y, z
-            points = input_data[:, :3]  # x, y, z are mandatory
+            points = input_data[:, :3].astype("float64")
+            finite_mask = np.isfinite(points).all(axis=1)
+            if not np.all(finite_mask):
+                dropped = points.shape[0] - int(finite_mask.sum())
+                warnings.warn(
+                    f"SavePointCloud: dropped {dropped} non-finite points before LAS write.",
+                    RuntimeWarning,
+                )
+                points = points[finite_mask]
+                input_data = input_data[finite_mask]
 
-            # Create LAS header and data
-            header = laspy.LasHeader(point_format=6)  # Point format 6 supports additional fields
-            las = laspy.LasData(header)
-            las.x = points[:, 0]
-            las.y = points[:, 1]
-            las.z = points[:, 2]
+            if points.size == 0:
+                raise ValueError("SavePointCloud: no valid points remain for LAS/LAZ output.")
 
+            mins = np.nanmin(points, axis=0)
+            maxs = np.nanmax(points, axis=0)
+            spans = np.maximum(maxs - mins, 1e-9)  # avoid zero span
+
+            # --- choose scales: target 0.1 mm, but increase if needed to stay within int32 ---
+            target_scale = np.array([1e-4, 1e-4, 1e-4], dtype=np.float64)  # 0.1 mm target
+            int32_max = np.iinfo(np.int32).max
+
+            # maximum integer magnitude we'd get with target_scale
+            needed_ints = spans / target_scale
+            scale_factor = np.ones(3, dtype=np.float64)
+            too_big = needed_ints > int32_max
+            if np.any(too_big):
+                scale_factor[too_big] = np.ceil(needed_ints[too_big] / int32_max)
+            scales = target_scale * scale_factor
+
+            header = laspy.LasHeader(point_format=3, version="1.2")
+            header.x_offset, header.y_offset, header.z_offset = mins
+            header.x_scale, header.y_scale, header.z_scale = scales
+
+            extra_defs = []
+            extra_arrays = []
             if input_data.shape[1] > 3:
                 extra_fields = input_data[:, 3:]
                 for i, col_data in enumerate(extra_fields.T, start=1):
                     field_name = f"extra_{i}"
                     dtype = col_data.dtype
-
-                    # Determine LAS-compatible field type
-                    if dtype.kind in {'i', 'u'}:  # Integer types
+                    if dtype.kind in {'i', 'u'}:
                         field_type = 'int32' if dtype.itemsize >= 4 else 'int16'
-                    elif dtype.kind == 'f':  # Floating-point types
+                    elif dtype.kind == 'f':
                         field_type = 'float64' if dtype.itemsize >= 8 else 'float32'
-                    else:  # Fallback for unsupported types
+                    else:
                         field_type = 'uint8'
+                        col_data = col_data.astype(np.uint8, copy=False)
+                    param = laspy.ExtraBytesParams(name=field_name, type=field_type)
+                    header.add_extra_dim(param)
+                    extra_defs.append(param)
+                    extra_arrays.append(col_data.astype(np.dtype(field_type), copy=False))
 
-                    # Add as extra dimension
-                    las.add_extra_dim(laspy.ExtraBytesParams(
-                        name=field_name,
-                        type=field_type
-                    ))
-                    las[field_name] = col_data
+            chunk_size = 5_000_000
+            with laspy.open(savepath, mode="w", header=header) as writer:
+                for start_idx in range(0, points.shape[0], chunk_size):
+                    end_idx = min(start_idx + chunk_size, points.shape[0])
+                    las_chunk = laspy.LasData(header)
+                    chunk_pts = points[start_idx:end_idx]
+                    las_chunk.x = chunk_pts[:, 0]
+                    las_chunk.y = chunk_pts[:, 1]
+                    las_chunk.z = chunk_pts[:, 2]
+                    for j, param in enumerate(extra_defs):
+                        las_chunk[param.name] = extra_arrays[j][start_idx:end_idx]
+                    writer.write_points(las_chunk.points)
 
-            las.write(savepath)
         except ImportError:
-            raise ImportError("Saving to LAS/LAZ format requires the 'laspy' library. Install it via pip.")
-    else:
-        raise ValueError(f"Unsupported file format '{format}'. Supported formats: ply, pcd, txt, xyz, asc, las, laz, pts, xyzn, xyzrgb.")
+            raise ImportError(
+                "Saving to LAS/LAZ format requires the 'laspy' library. Install it via pip."
+            )
 
-    print(f"[{TimeNow()}] {inspect.currentframe().f_code.co_name}: Point cloud successfully saved to: {savepath}. Shifted back by {shiftby}.")
+    else:
+        raise ValueError(
+            f"Unsupported file format '{format}'. Supported formats: "
+            f"ply, pcd, txt, xyz, asc, las, laz, pts, xyzn, xyzrgb."
+        )
+
+    print(
+        f"[{TimeNow()}] {inspect.currentframe().f_code.co_name}: "
+        f"Point cloud successfully saved to: {savepath}. Shifted by {shiftby}."
+    )
 
 @njit()
 def shift_pointcloud(pc, shift_by):
@@ -4503,7 +4606,8 @@ def AssignPointsToTrees3D(
     refine_cc3d=True,
     gap=0.05,                 # voxel size for per-tree CC3D
     cc3d_max_voxels=10_000_000,
-    use_gpu=False             # attempt GPU acceleration for KNN passes (requires RAPIDS)
+    use_gpu=False,            # attempt GPU acceleration for KNN passes (requires RAPIDS)
+    plot_extent=None          # optional polygon/path limiting valid plot area
 ):
     """Assign dense cloud points to stems via a two-pass nearest neighbour search.
 
@@ -4539,6 +4643,10 @@ def AssignPointsToTrees3D(
     use_gpu : bool, optional
         When `True`, attempts to accelerate k-NN searches with RAPIDS cuML + CuPy.
         If the GPU toolchain is unavailable or errors, the function falls back to CPU.
+    plot_extent : Any, optional
+        Polygon, mesh, raster, or point cloud describing the valid plot footprint.
+        Points falling outside this extent keep TreeID ``-1``. When ``None``, all
+        densecloud points remain eligible for assignment.
 
     Returns
     -------
@@ -4751,6 +4859,51 @@ def AssignPointsToTrees3D(
     densecloud = np.asarray(densecloud, dtype=np.float32)
     repopulated_data = np.asarray(repopulated_data)  # keep as-is; cast slices
 
+    extent_mask = None
+    if plot_extent is not None:
+        if densecloud.size == 0 or densecloud.shape[1] < 2:
+            warnings.warn(
+                "AssignPointsToTrees3D: densecloud has insufficient dimensions for extent filtering.",
+                RuntimeWarning,
+            )
+        else:
+            try:
+                poly_xy = _as_xy_vertices_from_extent(plot_extent, method="convex", alpha=1.0)
+            except Exception as exc:
+                warnings.warn(
+                    f"AssignPointsToTrees3D: failed to parse plot extent ({exc}). Using full cloud.",
+                    RuntimeWarning,
+                )
+            else:
+                if poly_xy.shape[0] < 3:
+                    warnings.warn(
+                        "AssignPointsToTrees3D: plot extent produced fewer than 3 vertices. Skipping.",
+                        RuntimeWarning,
+                    )
+                else:
+                    vx = np.ascontiguousarray(poly_xy[:, 0], dtype=np.float64)
+                    vy = np.ascontiguousarray(poly_xy[:, 1], dtype=np.float64)
+                    pts_xy = densecloud[:, :2].astype(np.float64, copy=False)
+                    inside = np.zeros(pts_xy.shape[0], dtype=bool)
+                    minx, maxx = float(vx.min()), float(vx.max())
+                    miny, maxy = float(vy.min()), float(vy.max())
+                    bbox_mask = (
+                        (pts_xy[:, 0] >= minx)
+                        & (pts_xy[:, 0] <= maxx)
+                        & (pts_xy[:, 1] >= miny)
+                        & (pts_xy[:, 1] <= maxy)
+                    )
+                    if np.any(bbox_mask):
+                        inside_idx = np.nonzero(bbox_mask)[0]
+                        inside_sub = _points_in_poly(
+                            pts_xy[inside_idx, 0],
+                            pts_xy[inside_idx, 1],
+                            vx,
+                            vy,
+                        )
+                        inside[inside_idx] = inside_sub
+                    extent_mask = inside
+
     if repopulated_data.size == 0:
         out0 = np.hstack([densecloud, -np.ones((densecloud.shape[0], 1), dtype=np.float32)])
         # no uniq_tids/heights; finalize trivially
@@ -4852,10 +5005,12 @@ def AssignPointsToTrees3D(
     if chunk_size is None or chunk_size <= 0:
         chunk_size = _choose_chunk_size(densecloud.shape[0], safe_k)
 
-    def _assign_block(dc_block_f32):
+    def _assign_core(dc_block_f32):
         B = dc_block_f32.shape[0]
-        assigned_tid = np.full(B, -1, dtype=np.int32)  # pre-allocate (int32 tree IDs)
-
+        assigned_tid = np.full(B, -1, dtype=np.int32)
+        if B == 0:
+            return assigned_tid
+        # PASS 1: nearest seed only (k=1)
         # PASS 1: nearest seed only (k=1)
         if gpu_state is not None:
             i1 = _gpu_seed_query(dc_block_f32[:, :3], k=1)
@@ -4921,7 +5076,33 @@ def AssignPointsToTrees3D(
                     pick_fb = neigh_tree_idx[has_ok_tree, :][np.arange(first_ok_fb.size), first_ok_fb]
                     assigned_tid[rows_fb[has_ok_tree]] = uniq_tids[pick_fb]
 
-        # Build output once per block (float32)
+        return assigned_tid
+
+    def _assign_block(dc_block_f32, extent_block_mask=None):
+        B_total = dc_block_f32.shape[0]
+        if B_total == 0:
+            return np.empty((0, dc_block_f32.shape[1] + 1), dtype=np.float32)
+
+        cols = dc_block_f32.shape[1] + 1
+        block_mask = None
+        if extent_block_mask is not None:
+            block_mask = np.asarray(extent_block_mask, dtype=bool)
+            if block_mask.shape[0] != B_total:
+                raise ValueError("AssignPointsToTrees3D: extent mask length mismatch.")
+            if not np.any(block_mask):
+                if include_unassigned:
+                    tid = -np.ones((B_total, 1), dtype=np.float32)
+                    return np.hstack([dc_block_f32, tid]).astype(np.float32, copy=False)
+                return np.empty((0, cols), dtype=np.float32)
+
+        if block_mask is None or np.all(block_mask):
+            assigned_tid = _assign_core(dc_block_f32)
+        else:
+            work_idx = np.nonzero(block_mask)[0]
+            sub_tid = _assign_core(dc_block_f32[work_idx])
+            assigned_tid = np.full(B_total, -1, dtype=np.int32)
+            assigned_tid[work_idx] = sub_tid
+
         if not include_unassigned:
             keep = assigned_tid != -1
             dc = dc_block_f32[keep, :]
@@ -4934,13 +5115,15 @@ def AssignPointsToTrees3D(
 
     # Process in chunks
     if chunk_size >= densecloud.shape[0]:
-        labeled = _assign_block(densecloud)
+        block_mask = extent_mask
+        labeled = _assign_block(densecloud, block_mask)
     else:
         pieces = []
         n = densecloud.shape[0]
         for s in range(0, n, chunk_size):
             e = min(s + chunk_size, n)
-            pieces.append(_assign_block(densecloud[s:e]))
+            block_mask = None if extent_mask is None else extent_mask[s:e]
+            pieces.append(_assign_block(densecloud[s:e], block_mask))
         labeled = (np.vstack(pieces).astype(np.float32, copy=False)
                    if pieces else np.empty((0, densecloud.shape[1] + 1), dtype=np.float32))
 
@@ -5061,7 +5244,7 @@ def AssignPointsToTrees3D(
 
 ###MAIN###
 @MeasureProcessingTime
-def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segmentate=False, debug=False, rasterizestep=1, XSectionThickness=0.07, XSectionCount=3, XSectionStep=1, RANSACn=DEFAULT_RANSAC_ITERATIONS, RANSACd=DEFAULT_RANSAC_OUTLIER_THRESHOLD, WATERSHEDminheight=DEFAULT_WATERSHED_MIN_HEIGHT, dbhlimit=1.5, subsamplestep=0.05, chunksize=10, segmentationgap=0.05, segmentationminheight=DEFAULT_SEGMENTATION_MIN_HEIGHT, datatype="MLS/TLS Raw", keepfields="xyz", outpcdformat="laz"):
+def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segmentation=False, debug=False, rasterizestep=1, XSectionThickness=0.07, XSectionCount=3, XSectionStep=1, RANSACn=DEFAULT_RANSAC_ITERATIONS, RANSACd=DEFAULT_RANSAC_OUTLIER_THRESHOLD, WATERSHEDminheight=DEFAULT_WATERSHED_MIN_HEIGHT, dbhlimit=1.5, subsamplestep=0.05, chunksize=10, segmentationgap=0.05, segmentationminheight=DEFAULT_SEGMENTATION_MIN_HEIGHT, datatype="MLS/TLS Raw", keepfields="xyz", outpcdformat="laz"):
         """Run the full plot-processing pipeline: cleaning, disc fitting, and metric export.
 
         Parameters
@@ -5072,7 +5255,7 @@ def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segment
             EPSG code used for all outputs. Defaults to ``32633``.
         reevaluate : bool, optional
             ``True`` to reuse intermediate products from a previous run. Defaults to ``False``.
-        segmentate : bool, optional
+        segmentation : bool, optional
             ``True`` to trigger tree segmentation after processing. Defaults to ``False``.
         debug : bool, optional
             Enable verbose logging and debug exports. Defaults to ``False``.
@@ -5169,7 +5352,7 @@ def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segment
                 reprocessingfolder = os.path.join(folder, f"{filename}-Processing-reevaluate")
                 os.rmdir(reprocessingfolder)
                 check_stop() 
-                EstimatePlotParameters(pointcloudpath=pointcloudpath, epsg=epsg, reevaluate=False, segmentate=False, debug=debug, rasterizestep=rasterizestep, XSectionThickness=XSectionThickness, XSectionCount=XSectionCount, XSectionStep=XSectionStep, RANSACn=RANSACn, RANSACd=RANSACd, WATERSHEDminheight=WATERSHEDminheight, dbhlimit=dbhlimit, subsamplestep=subsamplestep, chunksize=chunksize, segmentationgap=segmentationgap, segmentationminheight=segmentationminheight, datatype=datatype, outpcdformat=outpcdformat)
+                EstimatePlotParameters(pointcloudpath=pointcloudpath, epsg=epsg, reevaluate=False, segmentation=False, debug=debug, rasterizestep=rasterizestep, XSectionThickness=XSectionThickness, XSectionCount=XSectionCount, XSectionStep=XSectionStep, RANSACn=RANSACn, RANSACd=RANSACd, WATERSHEDminheight=WATERSHEDminheight, dbhlimit=dbhlimit, subsamplestep=subsamplestep, chunksize=chunksize, segmentationgap=segmentationgap, segmentationminheight=segmentationminheight, datatype=datatype, outpcdformat=outpcdformat)
                 return
        
         #Setting up variables for processing functions
@@ -5204,7 +5387,7 @@ def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segment
             sorsd = 1
             ptsfilter = 15
             CCfinestep = 0.05
-        elif datatype == "UAV LiDAR":
+        elif datatype in ("UAV LiDAR", "ALS (1000 pts/m^2)"):
             sorpts = 6
             sorsd = 1
             ptsfilter = 3
@@ -5378,13 +5561,13 @@ def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segment
             save_path=None,
         ) #Map scalar fields from the dense point cloud to the terrain data
 
-        if segmentate == False:
+        if segmentation == False:
             repopulated_data = _ensure_tail_order(repopulated_data, (-1, -3, -2))
 
         if debug == True:
             SavePointCloud(repopulated_data, os.path.join(folder, f"RepopulatedStems.{outpcdformat}"), shiftby=shiftby)
 
-        if segmentate == True:
+        if segmentation == True:
             repopulated_data = _timed_call(
                 "AssignPointsToTrees3D",
                 AssignPointsToTrees3D,
@@ -5397,6 +5580,7 @@ def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segment
                 include_unassigned=True,
                 refine_cc3d=True,
                 gap=segmentationgap,
+                plot_extent=dtmmesh,
             )  # bug needs to adjust based on datatype!
             if datatype not in ["iPhone LiDAR","CRP"]:
                 _timed_call(
@@ -5448,7 +5632,7 @@ def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segment
     ####INDEXY se meni
         discsall = _timed_call("ExtractCrossSections", ExtractCrossSections, repopulated_data, shiftby, disc_heights, XSectionThickness, debug, folder, outpcdformat=outpcdformat)
         discsall = _timed_call("IdentifyDiscs", IdentifyDiscs, discsall, labelsindex=IdDiscsIndexLabels, heightsindex=IdDiscsIndexHeight)
-        discsall = _timed_call("FitCrossSections", FitCrossSections, discsall=discsall, RANSACn=RANSACn, RANSACd=RANSACd, CCfinestep=CCfinestep, ptsfilter=ptsfilter, datatype=datatype, XSectionThickness=XSectionThickness, segmentate=segmentate)
+        discsall = _timed_call("FitCrossSections", FitCrossSections, discsall=discsall, RANSACn=RANSACn, RANSACd=RANSACd, CCfinestep=CCfinestep, ptsfilter=ptsfilter, datatype=datatype, XSectionThickness=XSectionThickness, segmentation=segmentation)
         check_stop()
         discsall = _timed_call("process_discsall", process_discsall, discsall, folder, debug=debug, shiftby=shiftby, outpcdformat=outpcdformat) #15 #sorting the cross sections ; bug- iphone and crp dont need tree height and hd
         discsall = _timed_call("filter_and_transform", filter_and_transform, discsall, max_d=dbhlimit) # modifying the data for export to shapefile
@@ -5511,7 +5695,7 @@ def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segment
                 os.rename (os.path.join(folder, f"PreprocessedStems.{outpcdformat}"),os.path.join(folder, f"15UnflattenPointCloud-CloudPreprocessedStems.{outpcdformat}")) #15
                 os.rename (os.path.join(folder, f"CloudTerrainDistances.{outpcdformat}"),os.path.join(folder, f"16GetTerrainDistances-CloudTerrainDistances.{outpcdformat}"))#16
                 os.rename (os.path.join(folder, f"RepopulatedStems.{outpcdformat}"),os.path.join(folder, f"17MapScalarFields-CloudRepopulatedStems.{outpcdformat}"))#17
-                if segmentate:
+                if segmentation:
                     os.rename (os.path.join(folder, f"DenseCloudTrees.{outpcdformat}"),os.path.join(folder, f"18AssignPointsToTrees3D-DenseCloudTrees.{outpcdformat}"))#18
                     #19
                 os.rename (os.path.join(folder, f"StemDiscsUnprocessed.{outpcdformat}"),os.path.join(folder, f"19ExtractCrossSections-CloudStemDiscsUnprocessed.{outpcdformat}"))#20
@@ -5567,7 +5751,7 @@ def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segment
                 os.rename (os.path.join(folder, f"PreprocessedStems.{outpcdformat}"),os.path.join(folder, f"12UnflattenPointCloud-CloudPreprocessedStems.{outpcdformat}")) #12
                 os.rename (os.path.join(folder, f"CloudTerrainDistances.{outpcdformat}"),os.path.join(folder, f"13GetTerrainDistances-CloudTerrainDistances.{outpcdformat}"))#13
                 os.rename (os.path.join(folder, f"RepopulatedStems.{outpcdformat}"),os.path.join(folder, f"14MapScalarFields-CloudRepopulatedStems.{outpcdformat}"))#14
-                if segmentate:
+                if segmentation:
                     os.rename (os.path.join(folder, f"DenseCloudTrees.{outpcdformat}"),os.path.join(folder, f"15AssignPointsToTrees3D-DenseCloudTrees.{outpcdformat}"))#15
                 os.rename (os.path.join(folder, f"StemDiscsUnprocessed.{outpcdformat}"),os.path.join(folder, f"16ExtractCrossSection-CloudStemDiscsUnprocessed.{outpcdformat}"))#16
                 os.rename (os.path.join(folder, f"StemDiscsProcessed.{outpcdformat}"),os.path.join(folder, f"17process_discsall-CloudStemDiscsProcessed.{outpcdformat}"))#17
@@ -5603,10 +5787,10 @@ def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segment
         elif debug == False:
             RenameFilesInDirectory(pointcloudpath)
 
-        if segmentate == "Debug" and reevaluate== False:
-            print("segmentate with debug files")
-        if segmentate == "SegmentateOnly":
-            print("segmentate with reevaluation to ensure polygons are available, debug trees available")
+        if segmentation == "Debug" and reevaluate== False:
+            print("segmentation with debug files")
+        if segmentation == "segmentationOnly":
+            print("segmentation with reevaluation to ensure polygons are available, debug trees available")
 
         elapsed = time.time() - start_time
         elapsed_str = datetime.fromtimestamp(elapsed, timezone.utc).strftime("%H:%M:%S")
@@ -5615,7 +5799,7 @@ def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segment
         with open(log_file, "a") as f:
             f.write(
                 f"File: {os.path.basename(pointcloudpath)} Started: {start_dt}, Duration: {elapsed_str}\n"
-                f"Parameters: debug={debug}, segmentate={segmentate}, datatype={datatype}, "
+                f"Parameters: debug={debug}, segmentation={segmentation}, datatype={datatype}, "
                 f"epsg={epsg}, subsamplestep={subsamplestep}, rasterizestep={rasterizestep}, "
                 f"XSectionThickness={XSectionThickness}, XSectionCount={XSectionCount}, "
                 f"XSectionStep={XSectionStep}, RANSACn={RANSACn}, RANSACd={RANSACd}, "
@@ -5869,7 +6053,7 @@ def DendRobotGUI():
             "  - Plot footprint extracted from the refined DTM mesh.",
             "  - Fields include ID (int), Area (float, m^2), TreeCount (int), BasalArea (float, m^2), TreeVolume (float, m^3), DgCm (float, cm) and Hg (float, m) populated by UpdatePlotInfo when DetectedTrees are available.",
             "",
-            "TreeFootprints (`TreeFootprints.shp`, only when `Segmentate` is enabled):",
+            "TreeFootprints (`TreeFootprints.shp`, only when `segmentation` is enabled):",
             "  - Ground-level footprint for each segmented stem.",
             "  - Fields:",
             "    - TreeID (int): identifier shared with TreeDiscs/DetectedTrees.",
@@ -5881,7 +6065,7 @@ def DendRobotGUI():
             "------------",
             "*.<ext> below uses the point-cloud format selected in the GUI (default 'txt').",
             (
-                "DenseCloudTrees.<ext> (Segmentate only) stores XYZ, any original scalar fields, "
+                "DenseCloudTrees.<ext> (segmentation only) stores XYZ, any original scalar fields, "
                 "the assigned TreeID and the height-above-terrain column."
             ),
             (
@@ -5929,7 +6113,7 @@ def DendRobotGUI():
                 "  17MapScalarFields-CloudRepopulatedStems.<ext> - Dense cloud with mapped TreeID/height "
                 "attributes."
             ),
-            "  18AssignPointsToTrees3D-DenseCloudTrees.<ext> - (Segmentate) dense cloud classified by TreeID.",
+            "  18AssignPointsToTrees3D-DenseCloudTrees.<ext> - (segmentation) dense cloud classified by TreeID.",
             "  19ExtractCrossSections-CloudStemDiscsUnprocessed.<ext> - Discs before fitting.",
             "  20process_discsall-CloudStemDiscsProcessed.<ext> - Discs after circle fitting.",
             (
@@ -5961,7 +6145,7 @@ def DendRobotGUI():
             (
                 "  14MapScalarFields-CloudRepopulatedStems.<ext> - Dense cloud with scalar transfer."
             ),
-            "  15AssignPointsToTrees3D-DenseCloudTrees.<ext> - (Segmentate) dense cloud classified by TreeID.",
+            "  15AssignPointsToTrees3D-DenseCloudTrees.<ext> - (segmentation) dense cloud classified by TreeID.",
             "  16ExtractCrossSection-CloudStemDiscsUnprocessed.<ext> - Raw discs.",
             "  17process_discsall-CloudStemDiscsProcessed.<ext> - Fitted discs.",
             "  18filter_and_transform-TreeDiscs.*          - TreeDiscs shapefile components.",
@@ -6193,7 +6377,7 @@ def DendRobotGUI():
             XSectionStep = float(XSectionStep_spinbox.get())
             subsamplestep = float(SubsampleStep_spinbox.get())
             epsg = int(epsg_var.get().split()[0])
-            segmentate = segmentate_var.get()
+            segmentation = segmentation_var.get()
             debug = debug_var.get()
             datatype = datatype_menu.get()
             dbhlim = float(maxdbh_spinbox.get())
@@ -6237,7 +6421,7 @@ def DendRobotGUI():
                 start_time = time.time()
                 EstimatePlotParameters(
                     pointcloudpath=pointcloudpath,
-                    segmentate=segmentate,
+                    segmentation=segmentation,
                     debug=debug,
                     epsg=epsg,
                     subsamplestep=subsamplestep,
@@ -6559,7 +6743,7 @@ def DendRobotGUI():
         initial_values = {
             'pointcloudpath': "",  # Initial Point Cloud Data Path
             'reevaluate': False,
-            'segmentate': False,
+            'segmentation': False,
             'debug': False,
             'epsg': "32633 (UTM-Czechia, Slovakia, Poland, Austria, Croatia, Denmark, Germany)",
             'subsamplestep': 0.05,
@@ -6624,7 +6808,7 @@ def DendRobotGUI():
         
         # Reset all Boolean (checkbox) values
         #reevaluate_var.set(initial_values['reevaluate'])
-        segmentate_var.set(initial_values['segmentate'])
+        segmentation_var.set(initial_values['segmentation'])
         update_segmentation_controls()
         debug_var.set(initial_values['debug'])
 
@@ -6783,18 +6967,44 @@ def DendRobotGUI():
             status_label.config(text="Status: Processing resumed...")
 
     def on_datatype_change(event):
-        if datatype_var.get() in ("iPhone LiDAR", "CRP"):
-            XSectionCount_var.set(2)  # Set the value to 1
-        elif datatype_var.get() in ("UAV LiDAR"):
-            SubsampleStep_var.set(0.1)
-            XSectionThickness_var.set(1)
-            chunksize_var.set(100)
-            XSectionCount_var.set(3)
-        else:
-            XSectionCount_var.set(3)  # Set the value to 6
-            SubsampleStep_var.set(0.05)
-            chunksize_var.set(10)
-            XSectionThickness_var.set(0.07)
+        datatype = datatype_var.get()
+        defaults = {
+            "maxdbh": 1.5,
+            "subsample": 0.05,
+            "chunksize": 10,
+            "dtm_resolution": 1.0,
+            "segmentation_gap": 0.05,
+            "segmentation_min_height": DEFAULT_SEGMENTATION_MIN_HEIGHT,
+            "xsection_thickness": 0.07,
+            "xsection_count": 3,
+            "xsection_step": 1,
+        }
+
+        if datatype in ("iPhone LiDAR", "CRP"):
+            defaults["xsection_count"] = 2
+        elif datatype == "UAV LiDAR":
+            defaults.update({
+                "subsample": 0.1,
+                "chunksize": 100,
+                "xsection_thickness": 1.0,
+            })
+        elif datatype == "ALS (1000 pts/m^2)":
+            defaults.update({
+                "chunksize": 100,
+                "segmentation_gap": 0.2,
+                "segmentation_min_height": 1.0,
+                "xsection_thickness": 0.2,
+            })
+
+        maxdbh_var.set(defaults["maxdbh"])
+        SubsampleStep_var.set(defaults["subsample"])
+        chunksize_var.set(defaults["chunksize"])
+        rasterizestep_var.set(defaults["dtm_resolution"])
+        segmentationgap_var.set(defaults["segmentation_gap"])
+        segmentationminheight_var.set(defaults["segmentation_min_height"])
+        XSectionThickness_var.set(defaults["xsection_thickness"])
+        XSectionCount_var.set(defaults["xsection_count"])
+        XSectionStep_var.set(defaults["xsection_step"])
    
     def update_max_seen_height(*args):
         try:
@@ -8000,7 +8210,7 @@ def DendRobotGUI():
     autofill_button.grid(row=2, column=4, padx=5, sticky="")
     create_tooltip(autofill_button, "Fill point clouds to entries from a folder and all its subfolders:\nRootFolder-\n         │-PlotFolder1\n         │-PlotFolder2\n         │-PlotFolder3\n              │-AnyOtherFiles\n              │→POINTCLOUD.laz←\n              │-Subfolder\n                   │→POINTCLOUD2.laz←")
 
-    # Create a frame for the reevaluate, segmentate, debug, and advanced controls
+    # Create a frame for the reevaluate, segmentation, debug, and advanced controls
     options_frame = tk.Frame(content)
     options_frame.grid(row=2, column=1, rowspan=1, pady=5)  # Adjust as needed for spacing
 
@@ -8013,14 +8223,14 @@ def DendRobotGUI():
     # reevaluate_checkbox.config(state=tk.DISABLED)
     # create_tooltip(reevaluate_label, "Skips parts of point cloud processing, reuses data from previous run and recalculates the DBHs, heights, etc.")  # Attach tooltip to the label
 
-    # Segmentate Checkbox and Tooltip
-    segmentate_var = BooleanVar(value=False)
-    segmentate_label = tk.Label(options_frame, text="Segmentate:")
-    segmentate_label.grid(row=0, column=0, sticky="s", padx=10)
-    segmentate_checkbox = tk.Checkbutton(options_frame, variable=segmentate_var)
-    segmentate_checkbox.grid(row=1, column=0, padx=10, pady=5, sticky="s")
-    segmentate_checkbox.config(state=tk.NORMAL)
-    create_tooltip(segmentate_label, "Individual trees will be extracted from the point cloud and filtered.\nIncreases time consumption significantly.")  # Attach tooltip to the label
+    # segmentation Checkbox and Tooltip
+    segmentation_var = BooleanVar(value=False)
+    segmentation_label = tk.Label(options_frame, text="Segmentation:")
+    segmentation_label.grid(row=0, column=0, sticky="s", padx=10)
+    segmentation_checkbox = tk.Checkbutton(options_frame, variable=segmentation_var)
+    segmentation_checkbox.grid(row=1, column=0, padx=10, pady=5, sticky="s")
+    segmentation_checkbox.config(state=tk.NORMAL)
+    create_tooltip(segmentation_label, "Individual trees will be extracted from the point cloud and filtered.\nIncreases time consumption significantly.")  # Attach tooltip to the label
 
     # Debug Checkbox and Tooltip
     debug_var = BooleanVar(value=False)
@@ -8058,6 +8268,7 @@ def DendRobotGUI():
 
     EPSG_OPTIONS = {
         "3067 (ETRS89/TM35FIN(E,N))": 3067, 
+        "3006 (SWEREF99 TM)": 3006, 
         "5514 (S-JTSK Krovak)": 5514,
         "32631 (UTM-Belgium)": 32631,
         "32630 (UTM-UK, Ghana)": 32630,
@@ -8099,7 +8310,7 @@ def DendRobotGUI():
     datatype_menu = ttk.Combobox(
         content,
         textvariable=datatype_var,
-        values=["MLS/TLS Raw", "MLS/TLS Cropped", "iPhone LiDAR", "CRP", "UAV LiDAR" ],
+        values=["MLS/TLS Raw", "MLS/TLS Cropped", "iPhone LiDAR", "CRP", "UAV LiDAR", "ALS (1000 pts/m^2)" ],
         state="readonly",  # Makes it readonly to prevent manual typing
         width=20
     )
@@ -8110,7 +8321,7 @@ def DendRobotGUI():
     # Data Type Dropdown (Combobox) for Selecting Only Valid Options
     datatype_label = tk.Label(content, text="Data Type:")
     datatype_label.grid(row=5, column=0, sticky="w", padx=10, pady=5)
-    create_tooltip(datatype_label, "This slightly modifies parameters of algorithm to better adapt to some features of different data sources. Use 'MLS/TLS Raw' if the point cloud wasn't cropped. If it was cropped, use 'MLS/TLS Cropped' to avoid losing peripheral trees. In case iPhone LiDAR or terrestrial photogrammetry Data use 'iPhone LiDAR' or 'CRP'. For UAV LiDAR there is an option too.")
+    create_tooltip(datatype_label, "This slightly modifies parameters of algorithm to better adapt to some features of different data sources. Use 'MLS/TLS Raw' if the point cloud wasn't cropped. If it was cropped, use 'MLS/TLS Cropped' to avoid losing peripheral trees. In case iPhone LiDAR or terrestrial photogrammetry data use 'iPhone LiDAR' or 'CRP'. For UAV LiDAR and high-density airborne LiDAR ('ALS (1000 pts/m^2)') there are dedicated options too.")
 
 
   
@@ -8187,11 +8398,11 @@ def DendRobotGUI():
     )
 
     def update_segmentation_controls(*args):
-        state = tk.NORMAL if segmentate_var.get() else tk.DISABLED
+        state = tk.NORMAL if segmentation_var.get() else tk.DISABLED
         segmentationgap_spinbox.config(state=state)
         segmentationminheight_spinbox.config(state=state)
 
-    segmentate_var.trace_add("write", update_segmentation_controls)
+    segmentation_var.trace_add("write", update_segmentation_controls)
     update_segmentation_controls()
 
     XSectionThickness_var, XSectionThickness_spinbox = add_spinbox(
@@ -8343,7 +8554,7 @@ def DendRobotGUI():
 ###Single file
 
 # cloud = r"D:\MarekHrdina\Dropbox\Projekty\testing-pcds\farotiny.laz"
-# EstimatePlotParameters(cloud, debug=False,segmentate=False, epsg=3067, datatype="MLS/TLS Cropped", outpcdformat="txt")#, XSectionCount=500, XSectionStep=0.1, XSectionThickness=0.1)
+# EstimatePlotParameters(cloud, debug=False,segmentation=False, epsg=3067, datatype="MLS/TLS Cropped", outpcdformat="txt")#, XSectionCount=500, XSectionStep=0.1, XSectionThickness=0.1)
 
 ###Run GUI###
 
