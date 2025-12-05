@@ -3129,61 +3129,9 @@ def SavePointCloud(input_data, savepath, fields="all", shiftby=[0, 0, 0]):
 
     # --- Apply XYZ shift ---
     input_data[:, :3] = input_data[:, :3] + shiftby
-    pts = input_data[:, :3]
-
-    # --- Guard against corrupted / padded / NaN rows ---
-    bad_mask = ~np.isfinite(pts).all(axis=1)
-    if input_data.shape[1] > 3:
-        bad_mask |= ~np.isfinite(input_data[:, 3:]).all(axis=1)
-
-    if np.all(np.isfinite(shiftby)):
-        xy_at_shift = (
-            np.isclose(pts[:, 0], shiftby[0], atol=1e-6, rtol=0.0)
-            & np.isclose(pts[:, 1], shiftby[1], atol=1e-6, rtol=0.0)
-        )
-        z_far = np.abs(pts[:, 2] - shiftby[2]) > 1_000.0
-        padded_rows = xy_at_shift & z_far
-        bad_mask |= padded_rows
-
-    if np.any(bad_mask):
-        dropped = int(bad_mask.sum())
-        warnings.warn(
-            f"SavePointCloud: dropped {dropped} rows with invalid or padded values before write.",
-            RuntimeWarning,
-        )
-        input_data = input_data[~bad_mask]
-        pts = input_data[:, :3]
-
-    # --- Robust axis guards to kill crazy outliers that would ruin scales/offsets ---
-    if pts.shape[0]:
-        finite_mask = np.isfinite(pts).all(axis=1)
-        pts_finite = pts[finite_mask]
-        if pts_finite.size:
-            q1 = np.percentile(pts_finite, 25, axis=0)
-            q3 = np.percentile(pts_finite, 75, axis=0)
-            iqr = q3 - q1
-            # Allow generous spread: at least 1 m in XY and 50 m in Z, or 5*IQR
-            min_tols = np.array([1.0, 1.0, 50.0], dtype=np.float64)
-            tol = np.maximum(5.0 * iqr, min_tols)
-            lo = q1 - tol
-            hi = q3 + tol
-            mask_axes = (
-                (pts[:, 0] >= lo[0]) & (pts[:, 0] <= hi[0]) &
-                (pts[:, 1] >= lo[1]) & (pts[:, 1] <= hi[1]) &
-                (pts[:, 2] >= lo[2]) & (pts[:, 2] <= hi[2])
-            )
-            if not np.all(mask_axes):
-                dropped = int((~mask_axes).sum())
-                warnings.warn(
-                    f"SavePointCloud: dropped {dropped} rows outside robust XYZ ranges "
-                    f"[{lo[0]:.2f},{hi[0]:.2f}]x[{lo[1]:.2f},{hi[1]:.2f}]x[{lo[2]:.2f},{hi[2]:.2f}].",
-                    RuntimeWarning,
-                )
-                input_data = input_data[mask_axes]
-                pts = input_data[:, :3]
 
     if input_data.size == 0:
-        raise ValueError("SavePointCloud: no valid points remain after filtering.")
+        raise ValueError("SavePointCloud: no points provided to save.")
 
     # --- Detect file extension and infer format ---
     _, file_extension = os.path.splitext(savepath)
@@ -3216,18 +3164,10 @@ def SavePointCloud(input_data, savepath, fields="all", shiftby=[0, 0, 0]):
     elif format in ["las", "laz"]:
         try:
             points = input_data[:, :3].astype("float64")
-            finite_mask = np.isfinite(points).all(axis=1)
-            if not np.all(finite_mask):
-                dropped = points.shape[0] - int(finite_mask.sum())
-                warnings.warn(
-                    f"SavePointCloud: dropped {dropped} non-finite points before LAS write.",
-                    RuntimeWarning,
-                )
-                points = points[finite_mask]
-                input_data = input_data[finite_mask]
-
+            if not np.isfinite(points).all():
+                raise ValueError("SavePointCloud: non-finite coordinates cannot be written to LAS/LAZ.")
             if points.size == 0:
-                raise ValueError("SavePointCloud: no valid points remain for LAS/LAZ output.")
+                raise ValueError("SavePointCloud: no points provided for LAS/LAZ output.")
 
             mins = np.nanmin(points, axis=0)
             maxs = np.nanmax(points, axis=0)
