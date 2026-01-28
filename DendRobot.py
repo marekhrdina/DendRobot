@@ -17,7 +17,6 @@ if sys.stderr is None:
 #imports #tweak
 import alphashape, base64, cc3d, fiona, functools, geopandas as gpd,heapq, inspect, laspy, math, numba, numpy as np, open3d as o3d, pandas as pd, psutil, pyvista as pv, platform, rasterio, re, shapely, shutil, subprocess, warnings, tempfile, tkinter as tk, threading, time, traceback
 from plyfile import PlyData
-
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue, Empty
 from datetime import datetime, timezone
@@ -28,15 +27,23 @@ from PIL import Image, ImageTk
 from pyproj import CRS
 from pyproj.exceptions import CRSError
 from rasterio.enums import Resampling
-from rasterio.features import shapes
+from rasterio.features import shapes, geometry_mask
 from rasterio.transform import from_origin, Affine
-from rasterio.warp import Resampling
+from rasterio.warp import Resampling, calculate_default_transform, reproject
 from scipy.ndimage import gaussian_filter, binary_closing, binary_fill_holes
 from scipy.optimize import least_squares
 from scipy.spatial import cKDTree, Delaunay, ConvexHull
 from shapely.affinity import translate
 from shapely.geometry import MultiPolygon,MultiPoint , Point, Polygon, shape, mapping
 from shapely.ops import unary_union
+try:
+    from shapely import contains_xy as shp_contains_xy  # shapely >=2.0
+except Exception:
+    shp_contains_xy = None
+try:
+    import shapely.vectorized as shp_vectorized  # deprecated in shapely >=2
+except Exception:
+    shp_vectorized = None
 from skimage.segmentation import watershed
 from skimage.feature import peak_local_max
 from tkinter import filedialog, BooleanVar, font, messagebox, simpledialog, ttk, TclError
@@ -683,6 +690,7 @@ def GetTerrainDistances(repopulated_trees: np.ndarray,
                               dtmmesh,
                               disc_heights,
                               XSectionThickness,
+                              cc_voxel_size=0.4,
                               debugdir=None,
                               grid_resolution=100, outpcdformat="txt"):
     """Compute terrain-relative metrics for each tree label in a merged cloud.
@@ -748,7 +756,7 @@ def GetTerrainDistances(repopulated_trees: np.ndarray,
             continue
 
         # 2) Refine by 3D connected component and keep only the lowest-Z component
-        refined = LabelConnectedComponents(input_data=treecloud, voxel_size=0.4, min_points=10)
+        refined = LabelConnectedComponents(input_data=treecloud, voxel_size=cc_voxel_size, min_points=10)
         if refined.shape[0] == 0:
             continue
         lowest_idx = int(np.argmin(refined[:, 2]))
@@ -1047,7 +1055,7 @@ def process_fit_cross_section(disc, RANSACn, RANSACd, CCfinestep, ptsfilter, dat
     datatype : str
         Input data classification controlling verticality and SOR parameters.
     XSectionThickness : float
-        Slice thickness used when "datatype" corresponds to UAV LiDAR or ALS (1000 pts/m^2).
+        Slice thickness used when "datatype" corresponds to UAV LiDAR or ALS (1000 pts/m^2) Raw/Cropped.
     segmentation : bool
         ``True`` to compute a concave hull perimeter for segmentationd crowns.
 
@@ -1065,7 +1073,7 @@ def process_fit_cross_section(disc, RANSACn, RANSACd, CCfinestep, ptsfilter, dat
     if datatype in ("MLS Raw", "MLS Cropped", "CRP", "iPhone LiDAR"):
         vradius = 0.05
         sornpoints = 12
-    elif datatype in ("UAV LiDAR", "ALS (1000 pts/m^2)"):
+    elif datatype in ("UAV LiDAR", "ALS (1000 pts/m^2) Raw", "ALS (1000 pts/m^2) Cropped"):
         vradius = XSectionThickness
         sornpoints = 3
     else:
@@ -1298,6 +1306,627 @@ def UpdateCrownIDs(trees_path, crowns_path, epsg_code=3067):
 
     except Exception as e:
         print(f"[{TimeNow()}] {inspect.currentframe().f_code.co_name}: Error: {e}")
+
+_ZS_STAT_CODES = {
+    "min": "min",
+    "max": "max",
+    "mean": "avg",
+    "sum": "sum",
+    "std": "std",
+    "var": "var",
+    "count": "cnt",
+    "median": "med",
+    "percentile": "pct",
+    "p25": "p25",
+    "p75": "p75",
+    "count_gt": "gt",
+    "count_lt": "lt",
+    "count_eq": "eq",
+}
+
+_RASTER_EXTENSIONS = {
+    ".tif",
+    ".tiff",
+    ".img",
+    ".vrt",
+}
+
+_POINTCLOUD_EXTENSIONS = {
+    ".las",
+    ".laz",
+    ".ply",
+    ".pcd",
+    ".txt",
+    ".xyz",
+    ".asc",
+    ".pts",
+    ".xyzn",
+    ".xyzrgb",
+    ".e57",
+    ".csv",
+}
+
+def _geodata_driver_and_limits(path):
+    """Return the GDAL driver and field-name length limits for a vector path."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".shp":
+        return "ESRI Shapefile", 10
+    if ext == ".gpkg":
+        return "GPKG", None
+    return None, None
+
+def _sanitize_field_name(name):
+    """Return a conservative ASCII field name safe for common vector drivers."""
+    cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", str(name))
+    cleaned = cleaned.strip("_")
+    return cleaned or "zs"
+
+def _unique_field_name(base, existing_names, max_len=None):
+    """Generate a unique field name, respecting driver length limits when provided."""
+    base = _sanitize_field_name(base)
+    if max_len:
+        base = base[:max_len]
+
+    candidate = base
+    counter = 1
+    lowered_existing = {str(n).lower() for n in existing_names}
+    while candidate.lower() in lowered_existing:
+        suffix = f"_{counter}"
+        if max_len:
+            trim = max_len - len(suffix)
+            trim = max(trim, 1)
+            candidate = f"{base[:trim]}{suffix}"
+            candidate = candidate[:max_len]
+        else:
+            candidate = f"{base}{suffix}"
+        counter += 1
+    existing_names.add(candidate)
+    return candidate
+
+def _format_percentile_code(percentile_value):
+    """Format a percentile value into a compact field suffix like p90 or p99_5."""
+    pct = float(percentile_value)
+    pct_txt = f"{pct:.2f}".rstrip("0").rstrip(".")
+    pct_txt = pct_txt.replace(".", "_")
+    return f"p{pct_txt}"
+
+def _build_zs_field_map(
+    stats,
+    base_token,
+    existing_names,
+    max_len=None,
+    threshold=None,
+    percentile_value=None,
+):
+    """Map statistic keys to unique output field names."""
+    token = _sanitize_field_name(base_token)
+    prefix = ""
+    stat_to_field = {}
+    for stat_key in stats:
+        if stat_key == "percentile":
+            if percentile_value is None:
+                raise ValueError("percentile_value is required when 'percentile' is selected.")
+            code = _format_percentile_code(percentile_value)
+        else:
+            code = _ZS_STAT_CODES.get(stat_key, stat_key)
+        if max_len:
+            # Try to preserve the statistic code even under Shapefile's 10-char limit.
+            stat_part = f"_{code}"
+            token_budget = max_len - len(prefix) - len(stat_part)
+            if token_budget >= 1:
+                token_short = token[:token_budget]
+                candidate = f"{prefix}{token_short}{stat_part}"
+            else:
+                candidate = f"{code}"[:max_len]
+        else:
+            candidate = f"{prefix}{token}_{code}"
+        stat_to_field[stat_key] = _unique_field_name(candidate, existing_names, max_len=max_len)
+
+    threshold_field = None
+    if threshold is not None and any(s in stats for s in ("count_gt", "count_lt", "count_eq")):
+        threshold_field = _unique_field_name("zs_thr", existing_names, max_len=max_len)
+
+    return stat_to_field, threshold_field
+
+def _compute_selected_stats(values, stats, threshold=None, percentile_value=None):
+    """Compute the requested statistics on a 1D array of values."""
+    arr = np.asarray(values, dtype=np.float64).ravel()
+    if arr.size:
+        arr = arr[np.isfinite(arr)]
+
+    pct_value = None
+    if "percentile" in stats:
+        if percentile_value is None:
+            raise ValueError("percentile_value is required when 'percentile' is selected.")
+        pct_value = float(percentile_value)
+        if (not np.isfinite(pct_value)) or pct_value < 0 or pct_value > 100:
+            raise ValueError("Percentile must be within [0, 100].")
+
+    if arr.size == 0:
+        empty = {
+            "min": np.nan,
+            "max": np.nan,
+            "mean": np.nan,
+            "sum": np.nan,
+            "std": np.nan,
+            "var": np.nan,
+            "count": 0,
+            "median": np.nan,
+            "percentile": np.nan,
+            "p25": np.nan,
+            "p75": np.nan,
+            "count_gt": 0,
+            "count_lt": 0,
+            "count_eq": 0,
+        }
+        return {k: empty[k] for k in stats}
+
+    out = {}
+    if "min" in stats:
+        out["min"] = float(np.min(arr))
+    if "max" in stats:
+        out["max"] = float(np.max(arr))
+    if "mean" in stats:
+        out["mean"] = float(np.mean(arr))
+    if "sum" in stats:
+        out["sum"] = float(np.sum(arr))
+    if "std" in stats:
+        out["std"] = float(np.std(arr))
+    if "var" in stats:
+        out["var"] = float(np.var(arr))
+    if "count" in stats:
+        out["count"] = int(arr.size)
+    if "median" in stats:
+        out["median"] = float(np.median(arr))
+    if "percentile" in stats:
+        out["percentile"] = float(np.percentile(arr, pct_value))
+    if "p25" in stats:
+        out["p25"] = float(np.percentile(arr, 25))
+    if "p75" in stats:
+        out["p75"] = float(np.percentile(arr, 75))
+
+    if any(s in stats for s in ("count_gt", "count_lt", "count_eq")):
+        if threshold is None:
+            raise ValueError("Threshold value is required for count >/< /= x statistics.")
+        thr = float(threshold)
+        if "count_gt" in stats:
+            out["count_gt"] = int(np.sum(arr > thr))
+        if "count_lt" in stats:
+            out["count_lt"] = int(np.sum(arr < thr))
+        if "count_eq" in stats:
+            out["count_eq"] = int(np.sum(arr == thr))
+
+    return out
+
+def _normalize_value_indices(value_index):
+    """Return a de-duplicated list of integer value indices."""
+    if value_index is None:
+        return None
+    if isinstance(value_index, (list, tuple, set, np.ndarray)):
+        raw = list(value_index)
+    else:
+        raw = [value_index]
+    normalized = []
+    seen = set()
+    for item in raw:
+        try:
+            idx = int(item)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Value indices must be integers.") from exc
+        if idx in seen:
+            continue
+        seen.add(idx)
+        normalized.append(idx)
+    return normalized
+
+def _enumerate_pointcloud_fields(path):
+    """Return point-cloud field options plus detected X/Y indices."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".las", ".laz"):
+        with laspy.open(path) as f:
+            dims = list(f.header.point_format.dimensions)
+        options = []
+        x_idx = y_idx = None
+        for idx, dim in enumerate(dims):
+            name = dim.name
+            if name == "X":
+                x_idx = idx
+            elif name == "Y":
+                y_idx = idx
+            options.append({"index": idx, "label": f"{idx}: {name}", "name": name})
+        if x_idx is None:
+            x_idx = 0
+        if y_idx is None:
+            y_idx = 1
+        return options, x_idx, y_idx
+
+    # Lightweight column counting for delimited text formats.
+    if ext in {".txt", ".xyz", ".asc", ".csv"}:
+        ncols = None
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                for line in fh:
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    tokens = re.split(r"[,\s;]+", stripped)
+                    tokens = [tok for tok in tokens if tok]
+                    if tokens:
+                        ncols = len(tokens)
+                        break
+        except OSError:
+            ncols = None
+        if ncols is None:
+            data = LoadPointCloud(path, return_type="np", fields="all")
+            ncols = int(data.shape[1])
+        options = []
+        for idx in range(ncols):
+            if idx == 0:
+                name = "X"
+            elif idx == 1:
+                name = "Y"
+            elif idx == 2:
+                name = "Z"
+            else:
+                name = f"Scalar{idx-2}"
+            options.append({"index": idx, "label": f"{idx}: {name}", "name": name})
+        return options, 0, 1
+
+    data = LoadPointCloud(path, return_type="np", fields="all")
+    ncols = int(data.shape[1])
+    options = []
+    for idx in range(ncols):
+        if idx == 0:
+            name = "X"
+        elif idx == 1:
+            name = "Y"
+        elif idx == 2:
+            name = "Z"
+        else:
+            name = f"Scalar{idx-2}"
+        options.append({"index": idx, "label": f"{idx}: {name}", "name": name})
+    return options, 0, 1
+
+def _enumerate_raster_bands(path):
+    """Return available raster band options with optional descriptions."""
+    with rasterio.open(path) as src:
+        descriptions = list(src.descriptions or [])
+        options = []
+        for band_idx in range(1, src.count + 1):
+            desc = descriptions[band_idx - 1] if band_idx - 1 < len(descriptions) else None
+            label = f"{band_idx}: {desc}" if desc else str(band_idx)
+            name = str(desc).strip() if desc else None
+            options.append({"index": band_idx, "label": label, "name": name})
+    return options
+
+def _fallback_pip_mask(geom, xs, ys):
+    """Fallback point-in-polygon mask when vectorized Shapely predicates are unavailable."""
+    if geom is None or geom.is_empty:
+        return np.zeros(xs.shape[0], dtype=bool)
+
+    def _poly_exterior_mask(poly, px, py):
+        coords = np.asarray(poly.exterior.coords, dtype=np.float64)
+        if coords.shape[0] >= 2 and np.allclose(coords[0], coords[-1]):
+            coords = coords[:-1]
+        vx = np.ascontiguousarray(coords[:, 0], dtype=np.float64)
+        vy = np.ascontiguousarray(coords[:, 1], dtype=np.float64)
+        return _points_in_poly(px, py, vx, vy)
+
+    mask = np.zeros(xs.shape[0], dtype=bool)
+    if isinstance(geom, Polygon):
+        mask |= _poly_exterior_mask(geom, xs, ys)
+    elif isinstance(geom, MultiPolygon):
+        for poly in geom.geoms:
+            mask |= _poly_exterior_mask(poly, xs, ys)
+    else:
+        try:
+            polygonized = geom.buffer(0)
+        except Exception:
+            return mask
+        if isinstance(polygonized, Polygon):
+            mask |= _poly_exterior_mask(polygonized, xs, ys)
+        elif isinstance(polygonized, MultiPolygon):
+            for poly in polygonized.geoms:
+                mask |= _poly_exterior_mask(poly, xs, ys)
+    return mask
+
+@timedone
+def ZonalStatistics(
+    polygons_path,
+    input_path,
+    input_kind="auto",
+    value_index=None,
+    stats=None,
+    threshold=None,
+    percentile_value=None,
+    overwrite=False,
+    output_path=None,
+    all_touched=True,
+    progress_callback=None,
+):
+    """Compute per-polygon statistics from a raster or point cloud and write them back."""
+    if not polygons_path or not os.path.exists(polygons_path):
+        raise FileNotFoundError("Polygon path does not exist.")
+    if not input_path or not os.path.exists(input_path):
+        raise FileNotFoundError("Input raster/point-cloud path does not exist.")
+
+    input_ext = os.path.splitext(input_path)[1].lower()
+    if input_kind == "auto":
+        input_kind = "raster" if input_ext in _RASTER_EXTENSIONS else "pointcloud"
+    input_kind = str(input_kind).lower()
+    if input_kind not in {"raster", "pointcloud"}:
+        raise ValueError("input_kind must be 'raster', 'pointcloud', or 'auto'.")
+
+    # Decide the output target early so driver limits are known for field naming.
+    if overwrite:
+        resolved_output = polygons_path
+    else:
+        if not output_path:
+            raise ValueError("Provide output_path when overwrite is False.")
+        resolved_output = output_path
+
+    driver, max_len = _geodata_driver_and_limits(resolved_output)
+
+    polygons_gdf = gpd.read_file(polygons_path)
+    if polygons_gdf.empty:
+        raise ValueError("Polygon layer is empty.")
+    original_gdf = polygons_gdf.copy()
+
+    if stats is None:
+        stats = ["min", "max", "mean", "sum", "std", "var", "count"]
+    stats = [s for s in stats if s in _ZS_STAT_CODES]
+    if not stats:
+        raise ValueError("No valid statistics were selected.")
+
+    needs_threshold = any(s in stats for s in ("count_gt", "count_lt", "count_eq"))
+    if needs_threshold and threshold is None:
+        raise ValueError("Threshold value is required for count >/< /= x statistics.")
+    threshold_value = float(threshold) if threshold is not None else None
+    needs_percentile = "percentile" in stats
+    percentile_value_num = None
+    if needs_percentile:
+        if percentile_value is None:
+            raise ValueError("Percentile value is required when 'percentile' is selected.")
+        percentile_value_num = float(percentile_value)
+        if (not np.isfinite(percentile_value_num)) or percentile_value_num < 0 or percentile_value_num > 100:
+            raise ValueError("Percentile must be within [0, 100].")
+    value_indices = _normalize_value_indices(value_index)
+
+    existing_names = set(original_gdf.columns)
+    base_tokens = []
+    field_options = None
+    x_idx = y_idx = None
+
+    # Prepare data sources.
+    if input_kind == "raster":
+        band_options = _enumerate_raster_bands(input_path)
+        band_by_index = {opt["index"]: opt for opt in band_options}
+        available_indices = {opt["index"] for opt in band_options}
+        if value_indices is None:
+            value_indices = [band_options[0]["index"]]
+        missing = [idx for idx in value_indices if idx not in available_indices]
+        if missing:
+            raise IndexError(f"Selected raster band(s) not available: {missing}")
+        base_tokens = []
+        for idx in value_indices:
+            opt = band_by_index.get(idx, {})
+            name = opt.get("name")
+            base_tokens.append(name if name else f"b{idx}")
+    else:
+        field_options, x_idx, y_idx = _enumerate_pointcloud_fields(input_path)
+        field_by_index = {opt["index"]: opt for opt in field_options}
+        available_indices = {opt["index"] for opt in field_options}
+        if value_indices is None:
+            # Default to Z where available, otherwise first non-XY column.
+            candidate = 2 if any(opt["index"] == 2 for opt in field_options) else 3
+            default_idx = candidate if any(opt["index"] == candidate for opt in field_options) else field_options[-1]["index"]
+            value_indices = [default_idx]
+        missing = [idx for idx in value_indices if idx not in available_indices]
+        if missing:
+            raise IndexError(f"Selected scalar field(s) not available: {missing}")
+        base_tokens = []
+        for idx in value_indices:
+            opt = field_by_index.get(idx, {})
+            name = opt.get("name")
+            base_tokens.append(name if name else f"f{idx}")
+
+    stat_fields_by_value = {}
+    results_by_field = {}
+    threshold_field = None
+    first_with_threshold = True
+    for idx, base_token in zip(value_indices, base_tokens):
+        thr_arg = threshold_value if (first_with_threshold and needs_threshold) else None
+        stat_to_field, thr_candidate = _build_zs_field_map(
+            stats,
+            base_token=base_token,
+            existing_names=existing_names,
+            max_len=max_len,
+            threshold=thr_arg,
+            percentile_value=percentile_value_num,
+        )
+        stat_fields_by_value[idx] = stat_to_field
+        for field_name in stat_to_field.values():
+            results_by_field[field_name] = []
+        if thr_candidate and threshold_field is None:
+            threshold_field = thr_candidate
+            results_by_field[threshold_field] = []
+        first_with_threshold = False
+
+    if input_kind == "raster":
+        with rasterio.open(input_path) as src:
+            raster_crs = src.crs
+            working_gdf = polygons_gdf
+            if raster_crs is not None and polygons_gdf.crs is not None and polygons_gdf.crs != raster_crs:
+                working_gdf = polygons_gdf.to_crs(raster_crs)
+            total_polygons = int(len(working_gdf))
+            completed_polygons = 0
+
+            dataset_window = rasterio.windows.Window(0, 0, src.width, src.height)
+            raster_bounds = src.bounds
+
+            for geom in working_gdf.geometry:
+                values_by_idx = {idx: np.array([], dtype=np.float64) for idx in value_indices}
+                if geom is not None and not geom.is_empty:
+                    if not geom.is_valid:
+                        try:
+                            geom = geom.buffer(0)
+                        except Exception:
+                            geom = None
+                    if geom is not None and not geom.is_empty:
+                        minx, miny, maxx, maxy = geom.bounds
+                        outside = (
+                            maxx < raster_bounds.left
+                            or minx > raster_bounds.right
+                            or maxy < raster_bounds.bottom
+                            or miny > raster_bounds.top
+                        )
+                        if not outside:
+                            try:
+                                window = rasterio.windows.from_bounds(
+                                    minx,
+                                    miny,
+                                    maxx,
+                                    maxy,
+                                    transform=src.transform,
+                                )
+                                window = window.round_offsets().round_lengths()
+                                window = window.intersection(dataset_window)
+                                if window.width > 0 and window.height > 0:
+                                    data = src.read(value_indices, window=window, masked=True)
+                                    if data.ndim == 2:
+                                        data = data[np.newaxis, ...]
+                                    win_transform = src.window_transform(window)
+                                    inside_mask = geometry_mask(
+                                        [mapping(geom)],
+                                        out_shape=data.shape[1:],
+                                        transform=win_transform,
+                                        invert=True,
+                                        all_touched=bool(all_touched),
+                                    )
+                                    for band_pos, val_idx in enumerate(value_indices):
+                                        band_data = data[band_pos]
+                                        combined_mask = (~inside_mask) | np.ma.getmaskarray(band_data)
+                                        masked = np.ma.array(band_data, mask=combined_mask)
+                                        values_by_idx[val_idx] = masked.compressed()
+                            except Exception:
+                                values_by_idx = {idx: np.array([], dtype=np.float64) for idx in value_indices}
+
+                for val_idx in value_indices:
+                    stat_values = _compute_selected_stats(
+                        values_by_idx[val_idx],
+                        stats,
+                        threshold=threshold_value,
+                        percentile_value=percentile_value_num,
+                    )
+                    stat_to_field = stat_fields_by_value[val_idx]
+                    for stat_key, field_name in stat_to_field.items():
+                        results_by_field[field_name].append(stat_values.get(stat_key, np.nan))
+                if threshold_field:
+                    results_by_field[threshold_field].append(threshold_value)
+                completed_polygons += 1
+                if progress_callback:
+                    try:
+                        progress_callback(completed_polygons, total_polygons)
+                    except Exception:
+                        pass
+
+    else:
+        needed_indices = []
+        for idx in (x_idx, y_idx, *value_indices):
+            if idx not in needed_indices:
+                needed_indices.append(idx)
+        index_to_pos = {idx: pos for pos, idx in enumerate(needed_indices)}
+        cloud = LoadPointCloud(input_path, return_type="np", fields=needed_indices)
+        if cloud.size == 0:
+            raise ValueError("Point cloud is empty.")
+
+        xs = np.ascontiguousarray(cloud[:, index_to_pos[x_idx]], dtype=np.float64)
+        ys = np.ascontiguousarray(cloud[:, index_to_pos[y_idx]], dtype=np.float64)
+        value_arrays = {
+            idx: np.ascontiguousarray(cloud[:, index_to_pos[idx]], dtype=np.float64)
+            for idx in value_indices
+        }
+        total_polygons = int(len(polygons_gdf))
+        completed_polygons = 0
+
+        for geom in polygons_gdf.geometry:
+            values_by_idx = {idx: np.array([], dtype=np.float64) for idx in value_indices}
+            if geom is not None and not geom.is_empty:
+                if not geom.is_valid:
+                    try:
+                        geom = geom.buffer(0)
+                    except Exception:
+                        geom = None
+                if geom is not None and not geom.is_empty:
+                    minx, miny, maxx, maxy = geom.bounds
+                    bbox_mask = (xs >= minx) & (xs <= maxx) & (ys >= miny) & (ys <= maxy)
+                    if np.any(bbox_mask):
+                        sub_x = xs[bbox_mask]
+                        sub_y = ys[bbox_mask]
+                        sub_values = {idx: value_arrays[idx][bbox_mask] for idx in value_indices}
+
+                        inside_sub = None
+                        try:
+                            if hasattr(shapely, "intersects_xy"):
+                                inside_sub = shapely.intersects_xy(geom, sub_x, sub_y)
+                            elif shp_contains_xy is not None:
+                                inside_sub = shp_contains_xy(geom, sub_x, sub_y)
+                            elif shp_vectorized is not None:
+                                inside_sub = shp_vectorized.contains(geom, sub_x, sub_y)
+                        except Exception:
+                            inside_sub = None
+
+                        if inside_sub is None:
+                            inside_sub = _fallback_pip_mask(geom, sub_x, sub_y)
+
+                        inside_mask = np.asarray(inside_sub, dtype=bool)
+                        for idx in value_indices:
+                            values_by_idx[idx] = sub_values[idx][inside_mask]
+
+            for val_idx in value_indices:
+                stat_values = _compute_selected_stats(
+                    values_by_idx[val_idx],
+                    stats,
+                    threshold=threshold_value,
+                    percentile_value=percentile_value_num,
+                )
+                stat_to_field = stat_fields_by_value[val_idx]
+                for stat_key, field_name in stat_to_field.items():
+                    results_by_field[field_name].append(stat_values.get(stat_key, np.nan))
+            if threshold_field:
+                results_by_field[threshold_field].append(threshold_value)
+            completed_polygons += 1
+            if progress_callback:
+                try:
+                    progress_callback(completed_polygons, total_polygons)
+                except Exception:
+                    pass
+
+    for field_name, values in results_by_field.items():
+        original_gdf[field_name] = values
+
+    out_dir = os.path.dirname(resolved_output)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    save_kwargs = {}
+    if driver:
+        save_kwargs["driver"] = driver
+    if driver == "GPKG":
+        save_kwargs["layer"] = os.path.splitext(os.path.basename(resolved_output))[0]
+        save_kwargs["mode"] = "w"
+
+    original_gdf.to_file(resolved_output, **save_kwargs)
+
+    return {
+        "polygons": int(len(original_gdf)),
+        "output_path": resolved_output,
+        "fields": list(results_by_field.keys()),
+        "input_kind": input_kind,
+        "value_indices": [int(v) for v in value_indices],
+        "value_index": int(value_indices[0]) if value_indices else None,
+        "percentile_value": percentile_value_num,
+    }
 
 ###General###
 def CheckEPSGIsMetric(epsg_code=None):
@@ -2612,6 +3241,29 @@ def LoadPointCloud(input_data, return_type="np", fields="all"):
     def Load3d(path, fields):
         ext = path.split('.')[-1].lower()
         if ext in ["las", "laz"]:
+            def _maybe_normalize_las_rgb(name, values):
+                """Normalize LAS RGB-like channels back to 0..255 when scaled."""
+                lname = str(name).lower()
+                if lname not in {"red", "green", "blue"}:
+                    return values
+                try:
+                    vmax = float(np.nanmax(values))
+                except Exception:
+                    return values
+                if (not np.isfinite(vmax)) or vmax <= 255.0:
+                    return values
+                # Many LAS files store colors as 10/12/16-bit integers.
+                # Heuristically scale down by a power of two closest to vmax/255.
+                try:
+                    ratio = max(vmax / 255.0, 1.0)
+                    scale = float(2 ** int(round(np.log2(ratio))))
+                    if not np.isfinite(scale) or scale <= 0:
+                        return values
+                    scaled = np.asarray(values, dtype=np.float64) / scale
+                    return np.clip(scaled, 0.0, 255.0)
+                except Exception:
+                    return values
+
             with laspy.open(path) as f:
                 las = f.read()
                 # Convert PointFormat to a list for iteration
@@ -2639,6 +3291,8 @@ def LoadPointCloud(input_data, return_type="np", fields="all"):
                     vals = las[dim.name]
                     if dim.name in ['X','Y','Z']:
                         vals = vals * las.header.scale[i] + las.header.offset[i]
+                    else:
+                        vals = _maybe_normalize_las_rgb(dim.name, vals)
                     cols.append(vals)
                 data = np.vstack(cols).T
                 return ensure_writable(data)
@@ -4193,6 +4847,530 @@ def SubtractRasters(raster1_path, raster2_path, output_path, epsg=32633, shiftby
     print(f"[{TimeNow()}] {inspect.currentframe().f_code.co_name}: Rasters subtracted with shift ({shift_x}, {shift_y}, {shift_z}).")
     return result_data
 
+def RasterHillshade8dir(rasterpath: str, target_epsg: int = 32633) -> str:
+    """
+    Create an 8-direction hillshade (N, NW, W, SW, S, SE, E, NE) using a 45° sun altitude.
+    The input is treated as a DEM; reprojection is performed when needed.
+
+    Parameters
+    ----------
+    rasterpath : str
+        Input raster path.
+    target_epsg : int, optional
+        EPSG code for the output hillshade. Defaults to ``32633``.
+
+    Returns
+    -------
+    str
+        Path to the generated hillshade GeoTIFF.
+    """
+    if not os.path.exists(rasterpath):
+        raise FileNotFoundError(f"Input file not found: {rasterpath}")
+
+    target_crs = CRS.from_epsg(int(target_epsg))
+    azimuths_deg = [0, 315, 270, 225, 180, 135, 90, 45]
+    alt_rad = np.deg2rad(45.0)
+    cos_alt, sin_alt = np.cos(alt_rad), np.sin(alt_rad)
+
+    with rasterio.open(rasterpath) as src:
+        band_index = 2 if src.count >= 2 else 1
+        arr = src.read(band_index, masked=True).astype("float32")
+        src_transform = src.transform
+        src_crs = src.crs
+        src_bounds = src.bounds
+        src_width, src_height = src.width, src.height
+
+    data = arr.filled(np.nan)
+
+    if src_crs is not None and CRS.from_user_input(src_crs) != target_crs:
+        transform, width, height = calculate_default_transform(
+            src_crs, target_crs, src_width, src_height, *src_bounds
+        )
+        dem = np.full((height, width), np.nan, dtype="float32")
+        reproject(
+            source=data,
+            destination=dem,
+            src_transform=src_transform,
+            src_crs=src_crs,
+            dst_transform=transform,
+            dst_crs=target_crs,
+            src_nodata=np.nan,
+            dst_nodata=np.nan,
+            resampling=Resampling.bilinear,
+        )
+        mask_src = (~np.ma.getmaskarray(arr)).astype("float32")
+        mask_dst = np.zeros((height, width), dtype="float32")
+        reproject(
+            source=mask_src,
+            destination=mask_dst,
+            src_transform=src_transform,
+            src_crs=src_crs,
+            dst_transform=transform,
+            dst_crs=target_crs,
+            resampling=Resampling.nearest,
+            src_nodata=0,
+            dst_nodata=0,
+        )
+        valid = mask_dst > 0.5
+    else:
+        dem = data
+        transform = src_transform
+        valid = np.isfinite(dem)
+
+    valid &= np.isfinite(dem)
+    if not np.any(valid):
+        raise ValueError(f"No valid data found in raster: {rasterpath}")
+
+    dem_safe = np.where(valid, dem, 0.0)
+    px = float(transform.a)
+    py = abs(float(transform.e))
+    if px == 0.0 or py == 0.0:
+        raise ValueError("Invalid pixel size derived from the raster transform.")
+
+    gy, gx = np.gradient(dem_safe, py, px)
+    p = gx
+    q = -gy
+    den = np.sqrt(p * p + q * q + 1.0)
+    den[~np.isfinite(den)] = 1.0
+    den[~valid] = 1.0
+
+    Nx = -p / den
+    Ny = -q / den
+    Nz = 1.0 / den
+
+    hs_stack = []
+    for az in azimuths_deg:
+        az_rad = np.deg2rad(az)
+        Lx = cos_alt * np.sin(az_rad)
+        Ly = cos_alt * np.cos(az_rad)
+        Lz = sin_alt
+
+        I = Nx * Lx + Ny * Ly + Nz * Lz
+        I = np.clip(I, 0, None)
+        I[~np.isfinite(I)] = 0.0
+        I *= 255.0
+        I[~valid] = 0.0
+        hs_stack.append(I.astype("float32"))
+
+    merged = np.mean(np.stack(hs_stack, axis=0), axis=0)
+    merged = np.nan_to_num(merged, nan=0.0, posinf=255.0, neginf=0.0)
+    hs_u8 = np.clip(merged, 0, 255).astype("uint8")
+    hs_u8[~valid] = 0
+
+    d, b = os.path.split(rasterpath)
+    name, _ = os.path.splitext(b)
+    out_path = os.path.join(d, f"{name}-8dhs.tif")
+
+    profile = {
+        "driver": "GTiff",
+        "dtype": "uint8",
+        "count": 1,
+        "width": hs_u8.shape[1],
+        "height": hs_u8.shape[0],
+        "crs": target_crs,
+        "transform": transform,
+        "compress": "deflate",
+        "nodata": 0,
+    }
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(hs_u8, 1)
+
+    return out_path
+
+def stack_rasters_to_multiband(raster_paths, out_path):
+    """
+    Stack single-band rasters into a multiband GeoTIFF, aligning to the first raster.
+
+    Parameters
+    ----------
+    raster_paths : Sequence[str]
+        Paths to single-band rasters to stack.
+    out_path : str
+        Destination multiband GeoTIFF path.
+    """
+    if not raster_paths:
+        raise ValueError("No rasters provided to stack.")
+
+    first_path = raster_paths[0]
+    with rasterio.open(first_path) as ref:
+        profile = ref.profile.copy()
+        ref_width, ref_height = ref.width, ref.height
+        reference_transform = ref.transform
+        reference_crs = ref.crs
+        first_band = ref.read(1)
+
+    profile.update(count=len(raster_paths))
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    target_dtype = np.dtype(profile["dtype"])
+
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(first_band.astype(target_dtype, copy=False), 1)
+        for band_index, path in enumerate(raster_paths[1:], start=2):
+            with rasterio.open(path) as src:
+                data = src.read(1)
+                needs_warp = (
+                    src.width != ref_width
+                    or src.height != ref_height
+                    or src.transform != reference_transform
+                    or src.crs != reference_crs
+                )
+                if needs_warp:
+                    aligned = np.zeros((ref_height, ref_width), dtype=data.dtype)
+                    reproject(
+                        source=data,
+                        destination=aligned,
+                        src_transform=src.transform,
+                        src_crs=src.crs,
+                        dst_transform=reference_transform,
+                        dst_crs=reference_crs,
+                        src_nodata=src.nodata if src.nodata is not None else 0,
+                        dst_nodata=0,
+                        resampling=Resampling.bilinear,
+                    )
+                    data = aligned
+                dst.write(data.astype(target_dtype, copy=False), band_index)
+
+    return out_path
+
+def _unique_path(path):
+    """Return a unique path by appending an incrementing suffix when needed."""
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    counter = 2
+    candidate = f"{base}_{counter}{ext}"
+    while os.path.exists(candidate):
+        counter += 1
+        candidate = f"{base}_{counter}{ext}"
+    return candidate
+
+def _rasterize_points_to_path(points, cell_size, epsg, out_path, shiftby=None):
+    """Rasterize XYZ points to a GeoTIFF with minimum Z per cell."""
+    if points.size == 0:
+        raise ValueError("No points provided for rasterization.")
+
+    shift_vec = np.zeros(3, dtype=np.float64)
+    if shiftby is not None:
+        shift_arr = np.asarray(shiftby, dtype=np.float64)
+        shift_vec[: min(3, shift_arr.size)] = shift_arr[:3]
+    shift_x, shift_y, shift_z = shift_vec
+
+    z_vals = points[:, 2] + shift_z
+    grid_x = np.floor_divide(points[:, 0], cell_size).astype(np.int64)
+    grid_y = np.floor_divide(points[:, 1], cell_size).astype(np.int64)
+
+    x_min, y_min = grid_x.min(), grid_y.min()
+    grid_x -= x_min
+    grid_y -= y_min
+
+    width = int(grid_x.max()) + 1
+    height = int(grid_y.max()) + 1
+    raster = np.full((height, width), np.nan, dtype=np.float32)
+
+    for xg, yg, z in zip(grid_x, grid_y, z_vals):
+        current = raster[yg, xg]
+        if np.isnan(current) or z < current:
+            raster[yg, xg] = z
+
+    west = (x_min * cell_size) + shift_x
+    north = ((y_min + height) * cell_size) + shift_y
+    transform = from_origin(west, north, cell_size, cell_size)
+    raster_out = np.flipud(raster)
+
+    profile = {
+        "driver": "GTiff",
+        "height": height,
+        "width": width,
+        "count": 1,
+        "dtype": raster_out.dtype,
+        "crs": CRS.from_epsg(int(epsg)),
+        "transform": transform,
+        "nodata": np.nan,
+    }
+    out_path = _unique_path(out_path)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(raster_out, 1)
+    return out_path
+
+def _dtm_min_by_cell(grid_x, grid_y, z_vals):
+    """Min-per-cell builder using Python dict (safer than numba typed Dict)."""
+    mapping = {}
+    for gx, gy, z in zip(grid_x, grid_y, z_vals):
+        key = (int(gx), int(gy))
+        prev = mapping.get(key)
+        if prev is None or z < prev:
+            mapping[key] = float(z)
+    return mapping
+
+def _heights_from_dtm(grid_x, grid_y, z_vals, dtm_map):
+    n = z_vals.shape[0]
+    heights = np.empty(n, dtype=np.float64)
+    valid = np.zeros(n, dtype=np.uint8)
+    for i in range(n):
+        key = (int(grid_x[i]), int(grid_y[i]))
+        dtm_z = dtm_map.get(key)
+        if dtm_z is not None:
+            heights[i] = z_vals[i] - dtm_z
+            valid[i] = 1
+        else:
+            heights[i] = np.nan
+    return heights, valid
+
+def _terrain_heights_from_mesh(points, mesh):
+    """Compute heights using a mesh-based DTM (KD-tree sampled mesh)."""
+    kd_tree_2d, grid_xy_valid, grid_z_valid, bounds, _ = build_mesh_height_index(mesh)
+    _, nn_idx = kd_tree_2d.query(points[:, :2], workers=-1)
+    terrain_z = grid_z_valid[nn_idx]
+    heights = points[:, 2] - terrain_z
+    valid = np.ones(points.shape[0], dtype=bool)
+
+    mesh_hull = None
+    mesh_bbox = None
+    try:
+        mesh_hull = MultiPoint(mesh.points[:, :2]).convex_hull
+        mesh_bbox = mesh_hull.bounds
+    except Exception:
+        mesh_hull = None
+        mesh_bbox = None
+
+    if mesh_hull is not None:
+        pts_xy = points[:, :2]
+        if mesh_bbox is not None:
+            minx, miny, maxx, maxy = mesh_bbox
+            bbox_mask = (
+                (pts_xy[:, 0] >= minx) & (pts_xy[:, 0] <= maxx) &
+                (pts_xy[:, 1] >= miny) & (pts_xy[:, 1] <= maxy)
+            )
+        else:
+            bbox_mask = np.ones(points.shape[0], dtype=bool)
+
+        inside = None
+        try:
+            if shp_contains_xy is not None:
+                inside_base = shp_contains_xy(mesh_hull, pts_xy[:, 0], pts_xy[:, 1])
+                inside = bbox_mask & inside_base
+            elif shp_vectorized is not None:
+                inside_base = shp_vectorized.contains(mesh_hull, pts_xy[:, 0], pts_xy[:, 1])
+                inside = bbox_mask & inside_base
+            else:
+                from shapely.prepared import prep
+                prepared = prep(mesh_hull)
+                inside_list = [prepared.contains(Point(x, y)) or prepared.touches(Point(x, y)) for x, y in pts_xy]
+                inside = bbox_mask & np.array(inside_list, dtype=bool)
+        except Exception:
+            inside = bbox_mask
+
+        valid &= inside
+
+    return heights, valid, mesh_hull, mesh_bbox
+
+def _heights_above_ground(points, cell_size, z_window=None):
+    """
+    Return per-point heights above terrain, preferring a mesh DTM (triangulated z-min cloud).
+    Falls back to gridded min-based DTM. Applies SOR to ground samples and optional coarse Z prefilter.
+    """
+    if cell_size <= 0:
+        raise ValueError("Cell size must be positive for DTM normalization.")
+    if points.size == 0:
+        return np.empty((0,), dtype=np.float64)
+
+    pts_for_dtm = points
+    if z_window is not None:
+        zmin_req, zmax_req = z_window
+        margin = max(cell_size, 0.5)
+        mask = (points[:, 2] >= zmin_req - margin) & (points[:, 2] <= zmax_req + margin)
+        if np.any(mask):
+            pts_for_dtm = points[mask]
+
+    zmin_pts, _ = RasterizeZminZmax(pts_for_dtm, gridsize=cell_size, outputdir=None)
+    # Filter ground samples to reduce spikes
+    try:
+        zmin_pts = SORFilter(zmin_pts, npoints=6, sd=1.0)
+    except Exception:
+        pass
+
+    if not zmin_pts.size:
+        raise ValueError("Failed to build DTM from points (no cells found).")
+
+    # Preferred path: mesh-based DTM
+    try:
+        mesh = DelaunayMesh25D(zmin_pts, outputdir=None)
+        heights, valid, dtm_hull, dtm_bbox = _terrain_heights_from_mesh(points, mesh)
+        return heights, valid, dtm_hull, dtm_bbox
+    except Exception:
+        pass
+
+    # Fallback: gridded min-based DTM
+    grid_x = np.floor_divide(points[:, 0], cell_size).astype(np.int64)
+    grid_y = np.floor_divide(points[:, 1], cell_size).astype(np.int64)
+    z_vals = points[:, 2]
+
+    gx0 = np.floor_divide(zmin_pts[:, 0], cell_size).astype(np.int64)
+    gy0 = np.floor_divide(zmin_pts[:, 1], cell_size).astype(np.int64)
+    dtm_map = _dtm_min_by_cell(gx0, gy0, zmin_pts[:, 2])
+    if len(dtm_map) == 0:
+        raise ValueError("Failed to build DTM from points (no cells found).")
+
+    heights, valid = _heights_from_dtm(grid_x, grid_y, z_vals, dtm_map)
+
+    dtm_hull = None
+    dtm_bbox = None
+    if zmin_pts.shape[0] >= 3:
+        try:
+            dtm_hull = MultiPoint(zmin_pts[:, :2]).convex_hull
+            dtm_bbox = dtm_hull.bounds  # (minx, miny, maxx, maxy)
+        except Exception:
+            dtm_hull = None
+            dtm_bbox = None
+
+    return heights, valid.astype(bool), dtm_hull, dtm_bbox
+
+def _format_slice_label(zmin, zmax):
+    """Return a compact string usable in filenames for a Z range."""
+    def _fmt(v):
+        if int(v) == v:
+            return str(int(v))
+        return f"{v:.2f}".rstrip("0").rstrip(".")
+    return f"{_fmt(zmin)}-{_fmt(zmax)}"
+
+def slice_point_cloud_file(
+    file_path,
+    z_ranges,
+    output_dir,
+    output_mode="points",
+    raster_step=1.0,
+    dtm_step=None,
+    epsg=32633,
+    make_hillshade=False,
+    stack_rasters=False,
+    normalize_dtm=True,
+):
+    """Slice a single point cloud into vertical ranges and save as clouds or rasters."""
+    supported_exts = {".ply", ".pcd", ".txt", ".xyz", ".asc", ".las", ".laz", ".pts", ".xyzn", ".xyzrgb"}
+    base_dir, base_name = os.path.split(file_path)
+    stem, ext = os.path.splitext(base_name)
+    out_ext = ext.lower() if ext.lower() in supported_exts else ".laz"
+
+    points = LoadPointCloud(file_path, "np")
+    z_column = points[:, 2]
+    dtm_mask = np.ones(points.shape[0], dtype=bool)
+    dtm_hull = None
+    dtm_bbox = None
+    if normalize_dtm:
+        cell = dtm_step if dtm_step is not None else raster_step
+        # Coarse Z prefilter window (min/max slice) to speed up DTM build
+        global_min = min(min(z0, z1) for z0, z1 in z_ranges)
+        global_max = max(max(z0, z1) for z0, z1 in z_ranges)
+        z_column, dtm_mask, dtm_hull, dtm_bbox = _heights_above_ground(points, cell, z_window=(global_min, global_max))
+        if not dtm_mask.any():
+            raise ValueError("No points overlap the DTM extent for slicing.")
+    results = {"input": file_path, "written": [], "skipped": 0}
+    per_slice_rasters = []
+    per_slice_hillshades = []
+
+    for idx, (zmin, zmax) in enumerate(z_ranges, start=1):
+        low = min(zmin, zmax)
+        high = max(zmin, zmax)
+        mask = dtm_mask & (z_column >= low) & (z_column <= high)
+        if dtm_hull is not None and mask.any():
+            pts_slice = points[mask]
+            if pts_slice.size:
+                inside = None
+                # Quick bbox prefilter
+                if dtm_bbox is not None:
+                    minx, miny, maxx, maxy = dtm_bbox
+                    bbox_mask = (
+                        (pts_slice[:, 0] >= minx) &
+                        (pts_slice[:, 0] <= maxx) &
+                        (pts_slice[:, 1] >= miny) &
+                        (pts_slice[:, 1] <= maxy)
+                    )
+                else:
+                    bbox_mask = np.ones(pts_slice.shape[0], dtype=bool)
+
+                try:
+                    if shp_contains_xy is not None:
+                        inside_base = shp_contains_xy(dtm_hull, pts_slice[:, 0], pts_slice[:, 1])
+                        inside = bbox_mask & inside_base
+                    elif shp_vectorized is not None:
+                        inside_base = shp_vectorized.contains(dtm_hull, pts_slice[:, 0], pts_slice[:, 1])
+                        inside = bbox_mask & inside_base
+                    else:
+                        from shapely.prepared import prep
+                        prepared = prep(dtm_hull)
+                        inside_list = [prepared.contains(Point(x, y)) or prepared.touches(Point(x, y)) for x, y in pts_slice[:, :2]]
+                        inside = bbox_mask & np.array(inside_list, dtype=bool)
+                except Exception:
+                    inside = bbox_mask
+
+                if inside is not None:
+                    mask_indices = np.where(mask)[0]
+                    # shrink mask for points outside hull/bbox
+                    mask[mask_indices] = inside
+        slice_points = points[mask]
+        if slice_points.size == 0:
+            results["skipped"] += 1
+            continue
+
+        label = _format_slice_label(low, high)
+        if output_mode == "points":
+            out_name = f"{stem}_slice{idx}_{label}{out_ext}"
+            out_path = _unique_path(os.path.join(output_dir, out_name))
+            SavePointCloud(slice_points, out_path)
+            results["written"].append(out_path)
+        else:
+            out_name = f"{stem}_slice{idx}_{label}.tif"
+            raster_path = _rasterize_points_to_path(slice_points, raster_step, epsg, os.path.join(output_dir, out_name))
+            results["written"].append(raster_path)
+            per_slice_rasters.append(raster_path)
+            if make_hillshade:
+                hs_path = RasterHillshade8dir(raster_path, target_epsg=epsg)
+                results["written"].append(hs_path)
+                per_slice_hillshades.append(hs_path)
+
+    if output_mode == "raster" and stack_rasters:
+        # Stack base rasters and optionally hillshades; keep only desired stacked output.
+        stacked_outputs = []
+        stacked_hs = None
+        stacked_path = None
+
+        # Only write the base stacked raster when hillshade is not requested.
+        if per_slice_rasters and not make_hillshade:
+            stacked_path = _unique_path(os.path.join(output_dir, f"{stem}_slices_stacked.tif"))
+            stack_rasters_to_multiband(per_slice_rasters, stacked_path)
+
+        if make_hillshade and per_slice_hillshades:
+            stacked_hs = _unique_path(os.path.join(output_dir, f"{stem}_slices_stacked-8dhs.tif"))
+            stack_rasters_to_multiband(per_slice_hillshades, stacked_hs)
+
+        # Remove individual rasters/hillshades
+        for path in per_slice_rasters + per_slice_hillshades:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+
+        # If both were produced, keep only the stacked hillshade; drop stacked base.
+        if stacked_hs:
+            stacked_outputs.append(stacked_hs)
+            if stacked_path and os.path.exists(stacked_path):
+                try:
+                    os.remove(stacked_path)
+                except Exception:
+                    pass
+        elif stacked_path:
+            stacked_outputs.append(stacked_path)
+
+        results["written"] = stacked_outputs if stacked_outputs else results["written"]
+
+    return results
+
 @timedone
 def WatershedCrownDelineation(
     rastertif,
@@ -4298,7 +5476,8 @@ def SaveTreeFootprintsShapefile(
     shapefile_name="TreeFootprints.shp",
     shiftby=(0.0, 0.0),     # add back global XY shift on save
     tree_id_field=-2,
-    tree_height_field=-3
+    tree_height_field=-3,
+    debug=False,
 ):
     """Generate stem footprint polygons per tree and save them as a shapefile.
 
@@ -4328,16 +5507,18 @@ def SaveTreeFootprintsShapefile(
     tree_height_field : int or None, optional
         Column index with per-tree heights. Defaults to ``-3``. Pass ``None`` to skip storing
         heights in the output table.
+    debug : bool, optional
+        When ``True``, writes a CSV report listing skipped TreeIDs and the reason. Defaults to ``False``.
     """
 
 
     # ---------- tunables ----------
     # decimate to this voxel (meters) before alpha-shape
     VOXEL = max(1e-3, pixel_size * 0.75)
-    # cap points per stem before alpha-shape
-    MAX_PTS = 1200
-    # stems above this many raw points use raster fallback (super fast)
-    RASTER_FALLBACK_N = 15000
+    # cap points per stem before alpha-shape (concave hull)
+    MAX_PTS = 100
+    # stems above this many raw points use raster fallback (fast, but coarse)
+    RASTER_FALLBACK_N = 20000
     # alpha tightness factor (smaller -> tighter)
     ALPHA_C = 0.8
     # parallel workers
@@ -4369,6 +5550,26 @@ def SaveTreeFootprintsShapefile(
     uniq_tids = tids_sorted[starts]
 
     shift_x, shift_y = float(shiftby[0]), float(shiftby[1])
+    os.makedirs(output_dir, exist_ok=True)
+
+    skipped = []
+    skipped_lock = threading.Lock()
+
+    def _record_skip(tid, pts_count, reason, area=None, method=None):
+        rec = {
+            "TreeID": int(tid),
+            "Pts": int(pts_count),
+            "Reason": str(reason),
+        }
+        if area is not None:
+            try:
+                rec["Area"] = float(area)
+            except Exception:
+                rec["Area"] = np.nan
+        if method is not None:
+            rec["Method"] = str(method)
+        with skipped_lock:
+            skipped.append(rec)
 
     # helpers
     def _largest_no_holes(geom):
@@ -4430,6 +5631,15 @@ def SaveTreeFootprintsShapefile(
         hull = _largest_no_holes(hull)
         return hull
 
+    def _convex_polygon(xy):
+        if xy.shape[0] > 3:
+            xy = _decimate_xy(xy, VOXEL)
+        try:
+            hull = MultiPoint(xy).convex_hull
+        except Exception:
+            hull = Polygon()
+        return _largest_no_holes(hull)
+
     def _disk(radius_px: int) -> np.ndarray:
         r = int(max(1, round(radius_px)))
         yy, xx = np.ogrid[-r:r+1, -r:r+1]
@@ -4462,7 +5672,7 @@ def SaveTreeFootprintsShapefile(
         for geom, val in shapes(grid, mask=(grid == 1), transform=transform):
             if int(val) == 1:
                 g = shapely.geometry.shape(geom)  # NOTE: defined lazily later in worker to avoid import in outer scope
-                if (not g.is_empty) and g.area >= min_area:
+                if not g.is_empty:
                     polys.append(g)
         if not polys:
             return Polygon()
@@ -4471,7 +5681,9 @@ def SaveTreeFootprintsShapefile(
     # worker per stem
     def _process_one(tid, s, e):
         pts = assigned[order[s:e]]
-        if pts.shape[0] < 3:
+        pts_count = int(pts.shape[0])
+        if pts_count < 3:
+            _record_skip(tid, pts_count, "too_few_points", area=0.0)
             return None
 
         xy = pts[:, :2]
@@ -4480,10 +5692,28 @@ def SaveTreeFootprintsShapefile(
         if pts.shape[0] >= RASTER_FALLBACK_N:
             # raster fallback for huge stems
             hull = _raster_polygon(xy)
+            method = "raster"
         else:
             hull = _alpha_polygon(xy)
+            method = "alpha"
 
-        if hull.is_empty or hull.area < float(min_area):
+        min_area_f = float(min_area)
+        hull_area = float(getattr(hull, "area", 0.0) or 0.0)
+
+        if hull.is_empty or hull_area < min_area_f:
+            # Robust fallback: try a convex hull on all points (decimated, no random cap).
+            hull_convex = _convex_polygon(xy)
+            hull_convex_area = float(getattr(hull_convex, "area", 0.0) or 0.0)
+            if not hull_convex.is_empty and hull_convex_area >= hull_area:
+                hull = hull_convex
+                hull_area = hull_convex_area
+                method = "convex"
+
+        if hull.is_empty:
+            _record_skip(tid, pts_count, "empty_hull", area=hull_area, method=method)
+            return None
+        if hull_area < min_area_f:
+            _record_skip(tid, pts_count, "area_below_min_area", area=hull_area, method=method)
             return None
 
         # apply XY shift
@@ -4505,8 +5735,9 @@ def SaveTreeFootprintsShapefile(
         return {
             "TreeID": int(tid),
             "TreeH":  tree_h,
-            "Pts":    int(pts.shape[0]),
+            "Pts":    pts_count,
             "Area":   float(hull.area),
+            "Method": method,
             "geom":   hull
         }
 
@@ -4519,16 +5750,31 @@ def SaveTreeFootprintsShapefile(
             r = f.result()
             if r is None:
                 continue
-            recs.append({k: r[k] for k in ("TreeID","TreeH","Pts","Area")})
+            recs.append({k: r[k] for k in ("TreeID","TreeH","Pts","Area","Method")})
             geoms.append(r["geom"])
 
     if not geoms:
         raise RuntimeError("SaveTreeFootprintsShapefile: no polygons were created.")
 
     gdf = gpd.GeoDataFrame(recs, geometry=geoms, crs=f"EPSG:{epsg}")
-    os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, shapefile_name)
     gdf.to_file(out_path, driver="ESRI Shapefile")
+    if debug and skipped:
+        skipped_df = pd.DataFrame(skipped)
+        skipped_path = os.path.join(
+            output_dir,
+            f"{os.path.splitext(shapefile_name)[0]}_skipped.csv",
+        )
+        try:
+            skipped_df.to_csv(skipped_path, index=False)
+            print(
+                f"[{TimeNow()}] SaveTreeFootprintsShapefile: skipped {len(skipped_df)} trees; "
+                f"details in {skipped_path}"
+            )
+        except Exception as exc:
+            print(
+                f"[{TimeNow()}] SaveTreeFootprintsShapefile: failed to write skipped report ({exc})."
+            )
     print(f"[{TimeNow()}] SaveTreeFootprintsShapefile: saved {len(gdf)} footprints to {out_path}")
     return out_path
 
@@ -4540,6 +5786,9 @@ def AssignPointsToTrees3D(
     height_field=-2,          # above-terrain height in repopulated_data
     tree_height_field=-1,     # per-tree height column in repopulated_data
     min_height=0.5,
+    height_tol=0.1,
+    const_height_tol=0.1,
+    drop_constant_height=True,
     height_margin=0.0,
     chunk_size=None,          # if None/<=0 -> auto-choose
     include_unassigned=True, # when False, final output contains NO -1 rows
@@ -4547,7 +5796,10 @@ def AssignPointsToTrees3D(
     gap=0.05,                 # voxel size for per-tree CC3D
     cc3d_max_voxels=10_000_000,
     use_gpu=False,            # attempt GPU acceleration for KNN passes (requires RAPIDS)
-    plot_extent=None          # optional polygon/path limiting valid plot area
+    plot_extent=None,         # optional polygon/path limiting valid plot area
+    debug_dir=None,           # optional folder for intermediate outputs
+    debug_format="laz",       # extension for debug point clouds
+    debug_prefix="18AssignPointsToTrees3D"
 ):
     """Assign dense cloud points to stems via a two-pass nearest neighbour search.
 
@@ -4568,6 +5820,15 @@ def AssignPointsToTrees3D(
         Column index with per-tree heights. Defaults to `-1`.
     min_height : float, optional
         Minimum point height above ground to consider. Defaults to `0.5`.
+    height_tol : float, optional
+        Vertical tolerance (metres) for the min-height contact validation. Defaults to `0.1`.
+    const_height_tol : float, optional
+        Maximum allowed height span (metres) in repopulated stems to consider the tree valid.
+        Trees whose repopulated height range is <= this tolerance are marked unassigned when
+        ``drop_constant_height`` is True. Defaults to `0.1`.
+    drop_constant_height : bool, optional
+        When `True`, immediately mark trees with near-constant repopulated heights as unassigned
+        after the first assignment pass. Defaults to `True`.
     height_margin : float, optional
         Extra vertical tolerance above the tree height. Defaults to `0.0`.
     chunk_size : int or None, optional
@@ -4587,6 +5848,12 @@ def AssignPointsToTrees3D(
         Polygon, mesh, raster, or point cloud describing the valid plot footprint.
         Points falling outside this extent keep TreeID ``-1``. When ``None``, all
         densecloud points remain eligible for assignment.
+    debug_dir : str or None, optional
+        Directory to save intermediate segmentation outputs. Disabled when ``None``.
+    debug_format : str, optional
+        File extension for debug outputs (e.g. ``\"laz\"`` or ``\"txt\"``).
+    debug_prefix : str, optional
+        Prefix used for debug output filenames.
 
     Returns
     -------
@@ -4680,6 +5947,9 @@ def AssignPointsToTrees3D(
         tree = cKDTree(assigned_xyz)
         voxel_size = float(voxel_size)
         max_voxels = int(max_voxels)
+        # Only reattach fragments that are genuinely close to an assigned tree.
+        # The user-requested rule is: within (gap - 10% of gap) => 0.9 * gap.
+        max_reattach_dist = max(0.0, voxel_size * 0.9)
 
         for comp_indices in clusters:
             local_idx = np.asarray(comp_indices, dtype=np.int64)
@@ -4707,20 +5977,14 @@ def AssignPointsToTrees3D(
                     nn = np.array([nn], dtype=np.int64)
                     dists = np.array([dists], dtype=np.float64)
 
-                valid = np.isfinite(dists)
+                # Enforce a strict distance cap tied to the CC3D gap size.
+                # Points farther away remain unassigned (-1).
+                valid = np.isfinite(dists) & (dists <= max_reattach_dist)
                 if not np.any(valid):
                     continue
 
-                candidate_ids = assigned_tid[nn[valid]]
-                if candidate_ids.size == 0:
-                    continue
-
-                uniq_ids, counts = np.unique(candidate_ids, return_counts=True)
-                if uniq_ids.size == 0:
-                    continue
-
-                best_tid = int(uniq_ids[np.argmax(counts)])
-                labeled_f32[sub_idx, -1] = float(best_tid)
+                # Per-point nearest reattachment within the allowed distance.
+                labeled_f32[sub_idx[valid], -1] = assigned_tid[nn[valid]].astype(np.float32, copy=False)
 
     def _init_gpu_knn(seeds_xyz_f32, centroids_xy_f32, seed_k, tree_k):
         """
@@ -4796,6 +6060,20 @@ def AssignPointsToTrees3D(
 
     # ---------------- guards & dtype normalization ----------------
 
+    def _save_debug_step(tag, arr):
+        if debug_dir is None:
+            return
+        if arr is None:
+            return
+        try:
+            if getattr(arr, "size", 0) == 0:
+                return
+        except Exception:
+            pass
+        os.makedirs(debug_dir, exist_ok=True)
+        path = os.path.join(debug_dir, f"{debug_prefix}-{tag}.{debug_format}")
+        SavePointCloud(arr, path, shiftby=None)
+
     densecloud = np.asarray(densecloud, dtype=np.float32)
     repopulated_data = np.asarray(repopulated_data)  # keep as-is; cast slices
 
@@ -4860,6 +6138,7 @@ def AssignPointsToTrees3D(
     bounds_max = np.empty(n_trees, dtype=np.float32)
     centroids_xy = np.empty((n_trees, 2), dtype=np.float32)
     height_by_idx_f32 = np.full(n_trees, -1.0, dtype=np.float32)
+    height_span_by_idx = np.full(n_trees, np.nan, dtype=np.float32)
 
     # sort by ID for grouped computation
     order = np.argsort(rep_ids.astype(np.int64, copy=False))
@@ -4900,23 +6179,65 @@ def AssignPointsToTrees3D(
                 else:
                     height_by_idx_f32[tidx] = np.float32(-1.0)
 
+        # per-tree height span from repopulated heights (for constant-height filtering)
+        finite_h = np.isfinite(rel_h)
+        if finite_h.any():
+            height_span_by_idx[tidx] = np.float32(np.nanmax(rel_h) - np.nanmin(rel_h))
+
+    # ---------------- constant-height filtering (before KD-trees) ----------------
+
+    active_mask = np.ones(n_trees, dtype=bool)
+    if drop_constant_height and height_span_by_idx.size:
+        span_tol = float(const_height_tol)
+        const_mask = np.isfinite(height_span_by_idx) & (height_span_by_idx <= span_tol)
+        if np.any(const_mask):
+            active_mask = ~const_mask
+            dropped_ids = uniq_tids[const_mask]
+            preview = ", ".join(map(str, dropped_ids[:5]))
+            if dropped_ids.size > 5:
+                preview += ", ..."
+            warnings.warn(
+                (
+                    f"AssignPointsToTrees3D: excluded {dropped_ids.size} trees with "
+                    f"height span <= {span_tol:.2f} m in repopulated stems: {preview}"
+                ),
+                RuntimeWarning,
+            )
+
+    active_tids = uniq_tids[active_mask]
+    if active_tids.size == 0 or densecloud.size == 0:
+        out0 = np.hstack([densecloud, -np.ones((densecloud.shape[0], 1), dtype=np.float32)])
+        return _append_tree_height_and_finalize(out0, uniq_tids=uniq_tids,
+                                                height_by_idx_f32=height_by_idx_f32)
+
+    bounds_min_active = bounds_min[active_mask]
+    bounds_max_active = bounds_max[active_mask]
+    centroids_xy_active = centroids_xy[active_mask]
+
     # ---------------- KD-Trees (float32) ----------------
 
-    seeds_xyz = repopulated_data[:, :3].astype(np.float32, copy=False)
+    seed_valid_mask = np.isin(rep_ids, active_tids)
+    seeds_xyz = repopulated_data[seed_valid_mask, :3].astype(np.float32, copy=False)
+    rep_ids_active = rep_ids[seed_valid_mask]
     n_seeds = seeds_xyz.shape[0]
+    if n_seeds == 0:
+        out0 = np.hstack([densecloud, -np.ones((densecloud.shape[0], 1), dtype=np.float32)])
+        return _append_tree_height_and_finalize(out0, uniq_tids=uniq_tids,
+                                                height_by_idx_f32=height_by_idx_f32)
 
-    seed_k_guess, tree_k_guess = _auto_neighbor_counts(n_seeds, n_trees)
+    n_trees_active = active_tids.size
+    seed_k_guess, tree_k_guess = _auto_neighbor_counts(n_seeds, n_trees_active)
     leafsize_seeds = _auto_leafsize(n_seeds)
-    leafsize_trees = _auto_leafsize(n_trees)
+    leafsize_trees = _auto_leafsize(n_trees_active)
 
     safe_k = max(1, min(seed_k_guess, n_seeds)) if n_seeds else 1
 
     # Map each seed row's TreeID -> compact index via searchsorted (fast, vectorized)
-    seeds_tid_idx = np.searchsorted(uniq_tids, rep_ids).astype(np.int32, copy=False)
+    seeds_tid_idx = np.searchsorted(active_tids, rep_ids_active).astype(np.int32, copy=False)
 
-    safe_k_tree = max(1, min(tree_k_guess, n_trees)) if n_trees else 1
+    safe_k_tree = max(1, min(tree_k_guess, n_trees_active)) if n_trees_active else 1
 
-    gpu_state = _init_gpu_knn(seeds_xyz, centroids_xy, safe_k, safe_k_tree) if use_gpu else None
+    gpu_state = _init_gpu_knn(seeds_xyz, centroids_xy_active, safe_k, safe_k_tree) if use_gpu else None
 
     if gpu_state is not None:
         cp_mod = gpu_state["cp"]
@@ -4938,7 +6259,7 @@ def AssignPointsToTrees3D(
         seed_nn_gpu = tree_nn_gpu = None
 
     kdt_seeds = cKDTree(seeds_xyz, leafsize=leafsize_seeds)
-    kdt_trees_xy = cKDTree(centroids_xy.astype(np.float32, copy=False), leafsize=leafsize_trees)
+    kdt_trees_xy = cKDTree(centroids_xy_active.astype(np.float32, copy=False), leafsize=leafsize_trees)
 
     # ---------------- assignment (chunked, two-pass KNN) ----------------
 
@@ -4961,11 +6282,11 @@ def AssignPointsToTrees3D(
         nearest_tree_idx = seeds_tid_idx[i1]  # (B,)
         z = dc_block_f32[:, 2]
 
-        n_minZ = bounds_min[nearest_tree_idx]
-        n_maxZ = bounds_max[nearest_tree_idx]
+        n_minZ = bounds_min_active[nearest_tree_idx]
+        n_maxZ = bounds_max_active[nearest_tree_idx]
 
         inside_mask = (z >= n_minZ) & (z <= n_maxZ)
-        assigned_tid[inside_mask] = uniq_tids[nearest_tree_idx[inside_mask]]
+        assigned_tid[inside_mask] = active_tids[nearest_tree_idx[inside_mask]]
 
         # PASS 2: only for rows above the current vertical range
         above_mask = z > n_maxZ
@@ -4985,14 +6306,14 @@ def AssignPointsToTrees3D(
             cand_tid_idx = seeds_tid_idx[neigh_idx]  # (R, k)
             z_above = z[rows][:, None]
 
-            valid_seed = ((z_above >= bounds_min[cand_tid_idx]) &
-                          (z_above <= bounds_max[cand_tid_idx]))
+            valid_seed = ((z_above >= bounds_min_active[cand_tid_idx]) &
+                          (z_above <= bounds_max_active[cand_tid_idx]))
             has_ok_seed = valid_seed.any(axis=1)
 
             if np.any(has_ok_seed):
                 first_ok = np.argmax(valid_seed[has_ok_seed], axis=1)
                 pick_idx = cand_tid_idx[has_ok_seed, :][np.arange(first_ok.size), first_ok]
-                assigned_tid[rows[has_ok_seed]] = uniq_tids[pick_idx]
+                assigned_tid[rows[has_ok_seed]] = active_tids[pick_idx]
 
             # Fallback to tree-centroid KNN (XY) for unresolved rows
             rows_fb = rows[~has_ok_seed]
@@ -5008,13 +6329,13 @@ def AssignPointsToTrees3D(
                 elif neigh_tree_idx.ndim == 1:
                     neigh_tree_idx = neigh_tree_idx[:, None]
 
-                valid_tree = ((z[rows_fb, None] >= bounds_min[neigh_tree_idx]) &
-                              (z[rows_fb, None] <= bounds_max[neigh_tree_idx]))
+                valid_tree = ((z[rows_fb, None] >= bounds_min_active[neigh_tree_idx]) &
+                              (z[rows_fb, None] <= bounds_max_active[neigh_tree_idx]))
                 has_ok_tree = valid_tree.any(axis=1)
                 if np.any(has_ok_tree):
                     first_ok_fb = np.argmax(valid_tree[has_ok_tree], axis=1)
                     pick_fb = neigh_tree_idx[has_ok_tree, :][np.arange(first_ok_fb.size), first_ok_fb]
-                    assigned_tid[rows_fb[has_ok_tree]] = uniq_tids[pick_fb]
+                    assigned_tid[rows_fb[has_ok_tree]] = active_tids[pick_fb]
 
         return assigned_tid
 
@@ -5067,11 +6388,14 @@ def AssignPointsToTrees3D(
         labeled = (np.vstack(pieces).astype(np.float32, copy=False)
                    if pieces else np.empty((0, densecloud.shape[1] + 1), dtype=np.float32))
 
+    _save_debug_step("Step1-Assigned", labeled)
+
     # ---------------- optional per-tree CC3D refinement ----------------
 
     if refine_cc3d and labeled.size > 0:
         pts = labeled  # float32 [N, D+1], last col TreeID as float32
         tree_ids_final = pts[:, -1].astype(np.int32, copy=False)
+        discarded_clusters = []
         for tid in np.unique(tree_ids_final):
             if tid == -1:
                 continue
@@ -5087,12 +6411,16 @@ def AssignPointsToTrees3D(
             small_global = idxs[comp_lbls != main_label]
             if small_global.size > 0:
                 pts[small_global, -1] = -1.0  # unassign smaller components
+                discarded_clusters.append(small_global.copy())
+        # Reattach discarded fragments to nearest assigned tree where possible
+        if discarded_clusters:
+            _reassign_discarded_clusters(pts, discarded_clusters, gap, cc3d_max_voxels)
         labeled = pts
+        _save_debug_step("Step2-CC3D", labeled)
 
     # ---------------- min-height contact validation ----------------
 
     if labeled.size > 0:
-        height_tol = 0.1  # metres
         span_tol = 0.1    # metres
         tree_ids_final = labeled[:, -1].astype(np.int32, copy=False)
         assigned_mask = tree_ids_final != -1
@@ -5113,7 +6441,9 @@ def AssignPointsToTrees3D(
                     if cand_idx < 0:
                         cand_idx += n_cols
                     if 0 <= cand_idx < n_cols - 1:
-                        height_idx = cand_idx
+                        # Only treat as a height field if it's not one of XYZ.
+                        if cand_idx >= 3:
+                            height_idx = cand_idx
 
             for tid in np.unique(tids_assigned):
                 idx = np.searchsorted(uniq_tids, tid)
@@ -5126,7 +6456,6 @@ def AssignPointsToTrees3D(
                 z_points = labeled[row_idx, 2]
                 min_z = bounds_min[idx]
 
-                # Prefer validating against per-point heights above terrain when available.
                 h_points = np.empty(0, dtype=np.float32)
                 if height_idx is not None:
                     h_vals = labeled[row_idx, height_idx].astype(np.float32, copy=False)
@@ -5165,8 +6494,8 @@ def AssignPointsToTrees3D(
                     RuntimeWarning,
                 )
 
-            if dropped_span:
-                ids = sorted(dropped_span)
+                if dropped_span:
+                    ids = sorted(dropped_span)
                 preview = ", ".join(map(str, ids[:5]))
                 if len(ids) > 5:
                     preview += ", ..."
@@ -5177,6 +6506,7 @@ def AssignPointsToTrees3D(
                     ),
                     RuntimeWarning,
                 )
+        _save_debug_step("Step3-MinHeight", labeled)
 
     # ---------------- append TreeHeight and finalize ----------------
 
@@ -5184,7 +6514,7 @@ def AssignPointsToTrees3D(
 
 ###MAIN###
 @MeasureProcessingTime
-def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segmentation=False, debug=False, rasterizestep=1, XSectionThickness=0.07, XSectionCount=3, XSectionStep=1, RANSACn=DEFAULT_RANSAC_ITERATIONS, RANSACd=DEFAULT_RANSAC_OUTLIER_THRESHOLD, WATERSHEDminheight=DEFAULT_WATERSHED_MIN_HEIGHT, dbhlimit=1.5, subsamplestep=0.05, chunksize=10, segmentationgap=0.05, segmentationminheight=DEFAULT_SEGMENTATION_MIN_HEIGHT, datatype="MLS/TLS Raw", keepfields="xyz", outpcdformat="laz"):
+def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segmentation=False, debug=False, rasterizestep=1, XSectionThickness=0.07, XSectionCount=3, XSectionStep=1, RANSACn=DEFAULT_RANSAC_ITERATIONS, RANSACd=DEFAULT_RANSAC_OUTLIER_THRESHOLD, WATERSHEDminheight=DEFAULT_WATERSHED_MIN_HEIGHT, dbhlimit=1.5, subsamplestep=0.05, chunksize=10, segmentationgap=0.05, segmentationminheight=DEFAULT_SEGMENTATION_MIN_HEIGHT, datatype="MLS/TLS Raw", keepfields="xyz", outpcdformat="laz", segmentation_output="auto", cropped=False, segmentation_debug_steps=False):
         """Run the full plot-processing pipeline: cleaning, disc fitting, and metric export.
 
         Parameters
@@ -5223,6 +6553,15 @@ def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segment
             Spatial gap (metres) used for filtering non-tree objects during segmentation. Defaults to ``0.05``.
         segmentationminheight : float, optional
             Minimum above-ground height (metres) considered during segmentation. Defaults to ``DEFAULT_SEGMENTATION_MIN_HEIGHT``.
+        segmentation_output : str, optional
+            Controls which points are written to ``DenseCloudTrees`` when segmentation is enabled.
+            Use ``"keep_all"`` to include unassigned points (TreeID = -1), ``"keep_trees"`` to
+            save only assigned tree points, or ``"auto"`` to preserve legacy behaviour
+            (debug keeps all, otherwise keep trees when dropped). Defaults to ``"auto"``.
+        cropped : bool, optional
+            When ``True``, skips the extra DTM SORFilter passes regardless of data type.
+        segmentation_debug_steps : bool, optional
+            When ``True`` and debug is enabled, save intermediate segmentation outputs.
         datatype : str, optional
             Descriptor of the acquisition type (for example ``"MLS/TLS Raw"``). Defaults to ``"MLS/TLS Raw"``.
         keepfields : str, optional
@@ -5292,7 +6631,7 @@ def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segment
                 reprocessingfolder = os.path.join(folder, f"{filename}-Processing-reevaluate")
                 os.rmdir(reprocessingfolder)
                 check_stop() 
-                EstimatePlotParameters(pointcloudpath=pointcloudpath, epsg=epsg, reevaluate=False, segmentation=False, debug=debug, rasterizestep=rasterizestep, XSectionThickness=XSectionThickness, XSectionCount=XSectionCount, XSectionStep=XSectionStep, RANSACn=RANSACn, RANSACd=RANSACd, WATERSHEDminheight=WATERSHEDminheight, dbhlimit=dbhlimit, subsamplestep=subsamplestep, chunksize=chunksize, segmentationgap=segmentationgap, segmentationminheight=segmentationminheight, datatype=datatype, outpcdformat=outpcdformat)
+                EstimatePlotParameters(pointcloudpath=pointcloudpath, epsg=epsg, reevaluate=False, segmentation=False, debug=debug, rasterizestep=rasterizestep, XSectionThickness=XSectionThickness, XSectionCount=XSectionCount, XSectionStep=XSectionStep, RANSACn=RANSACn, RANSACd=RANSACd, WATERSHEDminheight=WATERSHEDminheight, dbhlimit=dbhlimit, subsamplestep=subsamplestep, chunksize=chunksize, segmentationgap=segmentationgap, segmentationminheight=segmentationminheight, segmentation_output=segmentation_output, datatype=datatype, outpcdformat=outpcdformat, cropped=cropped, segmentation_debug_steps=segmentation_debug_steps)
                 return
        
         #Setting up variables for processing functions
@@ -5327,7 +6666,7 @@ def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segment
             sorsd = 1
             ptsfilter = 15
             CCfinestep = 0.05
-        elif datatype in ("UAV LiDAR", "ALS (1000 pts/m^2)"):
+        elif datatype in ("UAV LiDAR", "ALS (1000 pts/m^2) Raw", "ALS (1000 pts/m^2) Cropped"):
             sorpts = 6
             sorsd = 1
             ptsfilter = 3
@@ -5338,6 +6677,8 @@ def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segment
             ptsfilter = 15
             CCfinestep = 0.05
             print("DATA TYPE NOT SELECTED!")
+
+        is_cropped = bool(cropped) or str(datatype).endswith(" Cropped")
         
         subsamplestep, XSectionThickness, CCstep = [subsamplestep, XSectionThickness, 0.5]
         check_stop() 
@@ -5361,7 +6702,7 @@ def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segment
             minima, maxima = _timed_call("RasterizeZminZmax (DTM)", RasterizeZminZmax, cloud, gridsize=rasterizestep, outputdir=debugdir, shiftby=shiftby, outpcdformat=outpcdformat) #2 #finding DTM
             minima = _timed_call("SORFilter (DTM)", SORFilter, minima, sorpts, sorsd) #3 #Filtering DTM outliers, to make the dtm accurate #Tweak once for cropped or crp iphone
             check_stop() 
-            if datatype != "MLS/TLS Cropped":
+            if not is_cropped:
                 minima = _timed_call("SORFilter (DTM)", SORFilter, minima, 15, 1) #Twice for better filtering
                 minima = _timed_call("SORFilter (DTM)", SORFilter, minima, 15, 1) #Three times for even better filtering, which is really crucial for correct cross sections extraction
             check_stop()
@@ -5484,6 +6825,7 @@ def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segment
             dtmmesh=dtmmesh,
             disc_heights=disc_heights,
             XSectionThickness=XSectionThickness,
+            cc_voxel_size=1.0 if datatype in ("ALS (1000 pts/m^2) Raw", "ALS (1000 pts/m^2) Cropped") else 0.4,
             debugdir=debugdir,
             outpcdformat=outpcdformat,
         )
@@ -5508,6 +6850,7 @@ def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segment
             SavePointCloud(repopulated_data, os.path.join(folder, f"RepopulatedStems.{outpcdformat}"), shiftby=shiftby)
 
         if segmentation == True:
+            height_tol = 0.5 if datatype in ("ALS (1000 pts/m^2) Raw", "ALS (1000 pts/m^2) Cropped") else 0.1
             repopulated_data = _timed_call(
                 "AssignPointsToTrees3D",
                 AssignPointsToTrees3D,
@@ -5517,12 +6860,21 @@ def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segment
                 height_field=-2,
                 tree_height_field=-1,
                 min_height=segmentationminheight,
+                height_tol=height_tol,
                 include_unassigned=True,
                 refine_cc3d=True,
                 gap=segmentationgap,
                 plot_extent=dtmmesh,
+                debug_dir=folder if debug and segmentation_debug_steps else None,
+                debug_format=outpcdformat,
             )  # bug needs to adjust based on datatype!
             if datatype not in ["iPhone LiDAR","CRP"]:
+                if datatype in ("ALS (1000 pts/m^2) Raw", "ALS (1000 pts/m^2) Cropped"):
+                    footprint_min_area = 0.5
+                elif datatype == "UAV LiDAR":
+                    footprint_min_area = 0.25
+                else:
+                    footprint_min_area = 0.1
                 _timed_call(
                     "SaveTreeFootprintsShapefile",
                     SaveTreeFootprintsShapefile,
@@ -5532,10 +6884,11 @@ def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segment
                     pixel_size=0.05,
                     close_radius=2.0,
                     pad_pixels=2,
-                    min_area=0.01,
+                    min_area=footprint_min_area,
                     shiftby=shiftby[:2] if shiftby is not None else (0, 0),
                     tree_id_field=-1,
                     tree_height_field=-2,
+                    debug=debug,
                 )
             repopulated_data = _timed_call("CloudToMeshVerticalDistance", CloudToMeshVerticalDistance, repopulated_data, dtmmesh, shiftby=shiftby, max_dist=(max(disc_heights) + 0.5 * XSectionThickness) + 0.01) #Adding distance to ground as a field to the point cloud
             if repopulated_data.size and repopulated_data.shape[1] >= 2:
@@ -5544,10 +6897,17 @@ def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segment
                 assigned_mask = tree_ids != -1
                 dropped = int(np.count_nonzero(~assigned_mask))
 
-                if debug or dropped == 0:
+                output_mode = (segmentation_output or "auto").strip().lower()
+                if output_mode in ("keep all", "keep_all", "all"):
                     to_save = repopulated_data
-                else:
+                elif output_mode in ("keep trees", "keep_trees", "trees"):
                     to_save = np.ascontiguousarray(repopulated_data[assigned_mask])
+                else:
+                    # legacy behaviour: debug keeps all, otherwise drop unassigned when present
+                    if debug or dropped == 0:
+                        to_save = repopulated_data
+                    else:
+                        to_save = np.ascontiguousarray(repopulated_data[assigned_mask])
                 SavePointCloud(to_save, os.path.join(folder, f"DenseCloudTrees.{outpcdformat}"), shiftby=shiftby)
 
                 if dropped:
@@ -5754,7 +7114,7 @@ def EstimatePlotParameters(pointcloudpath, epsg=32633, reevaluate=False, segment
             with open(drlog_path, "r") as drlog_file:
                 drlog_contents = drlog_file.read()
             with open(log_file, "a") as processing_log:
-                processing_log.write("\n\n=== Processing (v0.5) ===\n")
+                processing_log.write("\n\n=== Processing (v0.6) ===\n")
                 processing_log.write(drlog_contents)
 
             os.remove(drlog_path)
@@ -5942,161 +7302,325 @@ def DendRobotGUI():
 
         _refresh_console_view()
 
-    def _build_outputs_overview_text():
-        lines = [
-            "Processing Outputs Overview",
-            "===========================",
-            "",
-            "Location",
-            "--------",
-            (
-                "All files are written inside the '<input-name>-Processing' folder that is "
-                "created next to the source point cloud."
-            ),
-            (
-                "When the Debug checkbox is disabled the files are renamed to include the "
-                "input file stem (for example 'plot01_TreeDiscs.shp'); with Debug enabled "
-                "the stage names listed below are kept verbatim."
-            ),
-            "",
-            "Core Shapefiles",
-            "---------------",
-            "TreeDiscs (`TreeDiscs.shp` together with the .dbf/.prj/.shx companions):",
-            "  - Cross-section catalogue with one record per fitted disc.",
-            "  - Fields:",
-            "    - ID_TREE (int): sequential stem identifier produced by the pipeline.",
-            "    - DISC_X / DISC_Y (float, metres): disc centroid in the project CRS.",
-            "    - DISC_H (float, metres): slice height above ground (rounded to centimetres).",
-            "    - DISC_D (float, centimetres): stem diameter derived from the fitted radius.",
-            "    - TREE_H (float, metres): estimated total tree height for the stem.",
-            "    - DISC_ERROR (float, metres): root-mean-square residual of the circle fit.",
-            "    - h/d_index (float, m/cm): TREE_H divided by DISC_D.",
-            "    - perimeter (float, metres): concave hull perimeter of the slice footprint.",
-            "",
-            (
-                "DetectedTrees (`DetectedTrees.shp`, produced for all datatypes except iPhone "
-                "LiDAR / CRP):"
-            ),
-            "  - One row per tree representing the disc at breast height (1.3 m).",
-            (
-                "  - Fields mirror `TreeDiscs`; here DISC_H is always 1.3 and DISC_D is the "
-                "DBH in centimetres."
-            ),
-            "",
-            "TreeCrowns (`TreeCrowns.shp`):",
-            "  - Watershed-derived crown polygons.",
-            "  - Fields:",
-            "    - CrownID (int): identifier used during crown segmentation.",
-            "    - Area (float, m^2): polygon area in square metres.",
-            "",
-            "PlotInfo (`PlotInfo.shp`):",
-            "  - Plot footprint extracted from the refined DTM mesh.",
-            "  - Fields include ID (int), Area (float, m^2), TreeCount (int), BasalArea (float, m^2), TreeVolume (float, m^3), DgCm (float, cm) and Hg (float, m) populated by UpdatePlotInfo when DetectedTrees are available.",
-            "",
-            "TreeFootprints (`TreeFootprints.shp`, only when `segmentation` is enabled):",
-            "  - Ground-level footprint for each segmented stem.",
-            "  - Fields:",
-            "    - TreeID (int): identifier shared with TreeDiscs/DetectedTrees.",
-            "    - TreeH (float, metres): height associated with the stem.",
-            "    - Pts (int): number of points supporting the footprint.",
-            "    - Area (float, m^2): footprint polygon area.",
-            "",
-            "Point Clouds",
-            "------------",
-            "*.<ext> below uses the point-cloud format selected in the GUI (default 'txt').",
-            (
-                "DenseCloudTrees.<ext> (segmentation only) stores XYZ, any original scalar fields, "
-                "the assigned TreeID and the height-above-terrain column."
-            ),
-            (
-                "RepopulatedStems.<ext> and CloudTerrainDistances.<ext> (debug mode) expose the "
-                "stem skeleton with appended TreeID, tree height and distance-to-ground attributes."
-            ),
-            (
-                "StemDiscsUnprocessed.<ext> / StemDiscsProcessed.<ext> (debug mode) keep the raw and "
-                "fitted disc points; the last columns hold the fitted centre (X,Y), radius (m), "
-                "RANSAC error (m) and concave-hull perimeter (m)."
-            ),
-            "",
-            "Debug Exports (standard datasets)",
-            "---------------------------------",
-            "Files are kept when Debug is enabled and the data type is not iPhone LiDAR / CRP:",
-            "  01SubsamplePointCloud-CloudSS.<ext>         - Voxel-subsampled cloud used for terrain modelling.",
-            "  02RasterizeZminZmax-CloudMin.<ext>          - Minimum surface cloud before DTM filtering.",
-            "  03SORFilter-CloudSOR.<ext>                  - Statistically filtered minima for DTM refinement.",
-            (
-                "  04PointcloudToRaster-RasterDTM.tif          - Refined terrain raster plus "
-                "DTMcrude/CloudDTMrefined variants."
-            ),
-            "  05DelaunayMesh25D-MeshDTM(.ply)             - Triangulated DTM mesh (shifted and unshifted).",
-            "  06MeshToShapefile-PlotInfo.*                - Plot footprint shapefile components.",
-            "  07CropCloudByExtent-CloudCropByDTM.<ext>    - Source cloud cropped to the reliable DTM footprint.",
-            "  08RasterizeZminZmax-CloudMax.<ext>          - Maximum surface cloud feeding the DSM.",
-            "  09PointcloudToRaster-RasterDSM.tif          - Digital surface model raster.",
-            (
-                "  10SubtractRasters-RasterCHM.tif             - Canopy height model derived from "
-                "DSM minus DTM."
-            ),
-            "  11WatershedCrownDelineation-TreeCrowns.*    - Crown polygons from watershed segmentation.",
-            "  12FlattenPointCloud-CloudFlat.<ext>         - Ground-normalised cloud used for stem detection.",
-            "  13ComputeDensity-CloudDensity.<ext>         - 2-D density response for stem candidate search.",
-            "  14FilterByValue-CloudFilterDensity.<ext>    - Density cloud after percentile filtering.",
-            (
-                "  15UnflattenPointCloud-CloudPreprocessedStems.<ext> - Stem points restored to original "
-                "elevation."
-            ),
-            (
-                "  16GetTerrainDistances-CloudTerrainDistances.<ext> - Stem cores with per-point terrain "
-                "distance and tree height."
-            ),
-            (
-                "  17MapScalarFields-CloudRepopulatedStems.<ext> - Dense cloud with mapped TreeID/height "
-                "attributes."
-            ),
-            "  18AssignPointsToTrees3D-DenseCloudTrees.<ext> - (segmentation) dense cloud classified by TreeID.",
-            "  19ExtractCrossSections-CloudStemDiscsUnprocessed.<ext> - Discs before fitting.",
-            "  20process_discsall-CloudStemDiscsProcessed.<ext> - Discs after circle fitting.",
-            (
-                "  19process_discsall-grouped_*.txt            - Optional per-tree disc stacks when group "
-                "export is enabled."
-            ),
-            "  20filter_and_transform-TreeDiscs.*          - TreeDiscs shapefile components.",
-            "  21filter_disc_height-DetectedTrees.*        - DetectedTrees shapefile components.",
-            "",
-            "Debug Exports (iPhone LiDAR / CRP)",
-            "----------------------------------",
-            "Stages are similar but the CHM/crown steps are skipped:",
-            "  01SubsamplePointCloud-CloudSS.<ext>         - Subsampled cloud.",
-            "  02RasterizeZminZmax-CloudMin.<ext>          - Minimum surface samples.",
-            "  03SORFilter-CloudSOR.<ext>                  - Filtered minima.",
-            (
-                "  04PointcloudToRaster-RasterDTM.tif          - Terrain raster plus "
-                "DTMcrude/CloudDTMrefined variants."
-            ),
-            "  05DelaunayMesh25D-MeshDTM(.ply)             - DTM mesh exports.",
-            "  06MeshToShapefile-PlotInfo.*                - Plot footprint.",
-            "  07CropCloudByExtent-CloudCrop.<ext>         - Cropped cloud (DTM only).",
-            "  08RasterizeZminZmax-CloudMax.<ext>          - Maximum surface cloud.",
-            "  09FlattenPointCloud-CloudFlat.<ext>         - Flattened cloud for stem detection.",
-            "  10ComputeDensity-CloudDensity.<ext>         - Density response.",
-            "  11FilterByValue-CloudFilterDensity.<ext>    - Filtered density.",
-            "  12UnflattenPointCloud-CloudPreprocessedStems.<ext> - Stem candidates.",
-            "  13GetTerrainDistances-CloudTerrainDistances.<ext> - Terrain distances.",
-            (
-                "  14MapScalarFields-CloudRepopulatedStems.<ext> - Dense cloud with scalar transfer."
-            ),
-            "  15AssignPointsToTrees3D-DenseCloudTrees.<ext> - (segmentation) dense cloud classified by TreeID.",
-            "  16ExtractCrossSection-CloudStemDiscsUnprocessed.<ext> - Raw discs.",
-            "  17process_discsall-CloudStemDiscsProcessed.<ext> - Fitted discs.",
-            "  18filter_and_transform-TreeDiscs.*          - TreeDiscs shapefile components.",
-            "  19filter_disc_height-DetectedTrees.*        - DetectedTrees shapefile components.",
-            "",
-            (
-                "Tip: leave Debug disabled for production runs to keep only the final shapefiles "
-                "and key point clouds, or enable it during development to inspect every intermediate artefact."
-            ),
-        ]
+    def _build_outputs_overview_text(lang="en"):
+        lang = (lang or "en").lower()
+        if lang.startswith("cs") or lang.startswith("cz"):
+            lines = [
+                "Processing Outputs Overview",
+                "===========================",
+                "",
+                "Kde se soubory ukládají?",
+                "-----------------------",
+                (
+                    "Všechny výstupy jsou v adresáři '<název-vstupu>-Processing' vedle zdrojového "
+                    "bodového mraku."
+                ),
+                (
+                    "Když je Debug vypnutý, soubory se přejmenují tak, aby obsahovaly název vstupu "
+                    "(např. 'plot01_TreeDiscs.shp'). Při zapnutí Debugu zůstávají zachované názvy "
+                    "kroků uvedené níže."
+                ),
+                "",
+                "Jak číst bodová mračna (scalar fields)",
+                "--------------------------------------",
+                (
+                    "Každý bod má vždy XYZ souřadnice. K nim se podle kroku přidávají další sloupce "
+                    "(tzv. scalar fields)."
+                ),
+                (
+                    "V LAS/LAZ souborech se tyto sloupce ukládají jako extra_1, extra_2, extra_3... "
+                    "a pořadí odpovídá tomu, v jakém je program přidal."
+                ),
+                (
+                    "Původní scalars z vašeho vstupu (např. intensity, RGB) se processingem ztrácí. "
+                    "Lze je obnovit pomocí funkce Map Scalar fields."
+                ),
+                "Nejčastější významy:",
+                "  - TreeID: přiřazené ID stromu (int). Hodnota -1 znamená nepřiřazeno.",
+                "  - HeightAboveGround: výška nad terénem (m).",
+                "  - TreeHeight: odhad výšky stromu (m) přidělená všem bodům daného stromu.",
+                "  - DiscHeight: výška řezu (m) pro výpočet průměru.",
+                "  - DiscRadius/DiscDiameter: poloměr/průměr řezu (m / cm) z kruhového fitu.",
+                "  - FitError: chyba fitu (m), menší = lepší kružnice.",
+                "",
+                "Hlavní shapefily",
+                "----------------",
+                "TreeDiscs (`TreeDiscs.shp` + .dbf/.prj/.shx):",
+                "  - Přehled všech vypočtených průřezů (disků) na stromech.",
+                "  - Pole:",
+                "    - ID_TREE: ID stromu.",
+                "    - DISC_X / DISC_Y: poloha středu disku (m).",
+                "    - DISC_H: výška disku nad terénem (m).",
+                "    - DISC_D: průměr kmene v dané výšce (cm).",
+                "    - TREE_H: odhad výšky stromu (m).",
+                "    - DISC_ERROR: chyba kruhového fitu (m).",
+                "    - h/d_index: poměr výšky k průměru.",
+                "    - perimeter: obvod tvaru řezu (m).",
+                "",
+                "DetectedTrees (`DetectedTrees.shp`, mimo iPhone LiDAR / CRP):",
+                "  - Jeden záznam na strom, používá průřez v 1.3 m (DBH).",
+                "  - Pole jsou stejná jako u TreeDiscs; DISC_H = 1.3 m.",
+                "",
+                "TreeCrowns (`TreeCrowns.shp`):",
+                "  - Polygony korun z CHM (watershed).",
+                "  - Pole: CrownID, Area (m^2).",
+                "",
+                "PlotInfo (`PlotInfo.shp`):",
+                "  - Tvar plochy (plot) z DTM.",
+                "  - Obsahuje např. Area, TreeCount, BasalArea, TreeVolume, Dg, Hg.",
+                "",
+                "TreeFootprints (`TreeFootprints.shp`, jen pokud je zapnutá segmentace):",
+                "  - P?dorys ka?d?ho stromu na zemi.",
+                "  - Pole: TreeID, TreeH, Pts, Area.",
+                "",
+                "Hlavní bodová mračna",
+                "--------------------",
+                "*.<ext> používá formát vybraný v GUI (default 'txt').",
+                "DenseCloudTrees.<ext> (segmentace):",
+                "  - Plné mračno s přiřazením TreeID.",
+                "  - Obsahuje: XYZ + původní scalars + TreeHeight + TreeID + HeightAboveGround.",
+                "",
+                "CloudTerrainDistances.<ext> (debug):",
+                "  - Jádra kmenů s výškou nad terénem.",
+                "  - Obsahuje: XYZ + TreeID + HeightAboveGround + TreeHeight.",
+                "",
+                "RepopulatedStems.<ext> (debug):",
+                "  - Husté mračno s přenesenými atributy ze stem?.",
+                "  - Obsahuje: XYZ + TreeID + HeightAboveGround + TreeHeight.",
+                "",
+                "StemDiscsUnprocessed.<ext> / StemDiscsProcessed.<ext> (debug):",
+                "  - Body jednotlivých řezů před/po fitu.",
+                "  - Poslední sloupce: střed řezu (X,Y), radius, chyba fitu, obvod.",
+                "",
+                "Co dělá jednotlivé kroky (srozumitelně)",
+                "----------------------------------------",
+                "DTM/DSM/CHM:",
+                "  - DTM = terén (zem), DSM = vršek vegetace, CHM = výška korun (DSM - DTM)."
+                "Plot area:",
+                "  - Z DTM se vyřízne spolehlivá plocha a ořízne se na ni celý vstup.",
+                "Stem detection:",
+                "  - Mračno se zploští na zem a hledají se místa s vysokou hustotou bodů (kmeny).",
+                "Repopulated stems:",
+                "  - Informace o kmenech (TreeID, výška nad terénem, odhad výšky stromu) se přenese "
+                "do hustého mračna.",
+                "Segmentation (AssignPointsToTrees3D):",
+                "  - Každý bod se přiřadí k nejbližšímu kmeni a zkontroluje se výška.",
+                "Cross sections:",
+                "  - V pravidelných výškách se vytvoří řezy a z nich se fitují průměry.",
+                "",
+                "Debug výstupy (standardní datové typy)",
+                "--------------------------------------",
+                "  01SubsamplePointCloud-CloudSS.<ext>         - Řídké mračno pro výpočet terénu.",
+                "  02RasterizeZminZmax-CloudMin.<ext>          - Minimum výšek (základ DTM).",
+                "  03SORFilter-CloudSOR.<ext>                  - Vyšší minimum (DTM).",
+                "  04PointcloudToRaster-RasterDTM.tif          - Terénní rastr (DTM).",
+                "  05DelaunayMesh25D-MeshDTM(.ply)             - Trojúhelníková síť terénu.",
+                "  06MeshToShapefile-PlotInfo.*                - Plocha plochy (plot).",
+                "  07CropCloudByExtent-CloudCropByDTM.<ext>    - Oříznutí na spolehlivou plochu.",
+                "  08RasterizeZminZmax-CloudMax.<ext>          - Maximum výšek (základ DSM).",
+                "  09PointcloudToRaster-RasterDSM.tif          - DSM rastr.",
+                "  10SubtractRasters-RasterCHM.tif             - CHM rastr (výška korun).",
+                "  11WatershedCrownDelineation-TreeCrowns.*    - Polygony korun.",
+                "  12FlattenPointCloud-CloudFlat.<ext>         - Zploštění mračna pro kmenné body.",
+                "  13ComputeDensity-CloudDensity.<ext>         - Hustota bodů (hledání kmenů).",
+                "  14FilterByValue-CloudFilterDensity.<ext>    - Filtrování hustoty.",
+                "  15UnflattenPointCloud-CloudPreprocessedStems.<ext> - Kandidáti kmenů.",
+                "  16GetTerrainDistances-CloudTerrainDistances.<ext> - Výška nad terénem.",
+                "  17MapScalarFields-CloudRepopulatedStems.<ext> - Přenos atributů do hustého mračna.",
+                "  18AssignPointsToTrees3D-DenseCloudTrees.<ext> - Segmentace na TreeID.",
+                "  19ExtractCrossSections-CloudStemDiscsUnprocessed.<ext> - Syrové řezy.",
+                "  20process_discsall-CloudStemDiscsProcessed.<ext> - Zpracované řezy.",
+                "  20process_discsall-grouped_*.txt              - Volitelný export řezů po jednotlivých stromech.",
+                "  20filter_and_transform-TreeDiscs.*          - TreeDiscs shapefile.",
+                "  21filter_disc_height-DetectedTrees.*        - DetectedTrees shapefile.",
+                "",
+                "Debug výstupy (iPhone LiDAR / CRP)",
+                "----------------------------------",
+                "Stejn? kroky jako v??e, ale bez DSM/CHM a korun:",
+                "  01SubsamplePointCloud-CloudSS.<ext>",
+                "  02RasterizeZminZmax-CloudMin.<ext>",
+                "  03SORFilter-CloudSOR.<ext>",
+                "  04PointcloudToRaster-RasterDTM.tif",
+                "  05DelaunayMesh25D-MeshDTM(.ply)",
+                "  06MeshToShapefile-PlotInfo.*",
+                "  07CropCloudByExtent-CloudCrop.<ext>",
+                "  08RasterizeZminZmax-CloudMax.<ext>",
+                "  09FlattenPointCloud-CloudFlat.<ext>",
+                "  10ComputeDensity-CloudDensity.<ext>",
+                "  11FilterByValue-CloudFilterDensity.<ext>",
+                "  12UnflattenPointCloud-CloudPreprocessedStems.<ext>",
+                "  13GetTerrainDistances-CloudTerrainDistances.<ext>",
+                "  14MapScalarFields-CloudRepopulatedStems.<ext>",
+                "  15AssignPointsToTrees3D-DenseCloudTrees.<ext>",
+                "  16ExtractCrossSection-CloudStemDiscsUnprocessed.<ext>",
+                "  17process_discsall-CloudStemDiscsProcessed.<ext>",
+                "  18filter_and_transform-TreeDiscs.*",
+                "  19filter_disc_height-DetectedTrees.*",
+                "",
+                (
+                    "Tip: Pro běžné použití nechávejte Debug vypnuté. Zapněte ho pouze tehdy, kdy "
+                    "potřebujete kontrolovat jednotlivé kroky."
+                ),
+            ]
+        else:
+            lines = [
+                "Processing Outputs Overview",
+                "===========================",
+                "",
+                "Location",
+                "--------",
+                (
+                    "All files are written inside the '<input-name>-Processing' folder that is "
+                    "created next to the source point cloud."
+                ),
+                (
+                    "When the Debug checkbox is disabled the files are renamed to include the "
+                    "input file stem (for example 'plot01_TreeDiscs.shp'); with Debug enabled "
+                    "the stage names listed below are kept verbatim."
+                ),
+                "",
+                "How to read point clouds (scalar fields)",
+                "----------------------------------------",
+                (
+                    "Every point always has XYZ coordinates. Depending on the step, additional "
+                    "columns (scalar fields) are appended."
+                ),
+                (
+                    "In LAS/LAZ files these columns are stored as extra_1, extra_2, extra_3... "
+                    "in the order they were added."
+                ),
+                (
+                    "Original scalars from your input (e.g., intensity, RGB) are lost during processing and "
+                    "can be restored using Map Scalar Fields function."
+                ),
+                "Common meanings:",
+                "  - TreeID: assigned tree identifier (int). -1 means 'unassigned'.",
+                "  - HeightAboveGround: height above terrain (m).",
+                "  - TreeHeight: estimated tree height (m) copied to all points of the tree.",
+                "  - DiscHeight: slice height (m) used for diameter computation.",
+                "  - DiscRadius/DiscDiameter: radius/diameter (m / cm) from circle fitting.",
+                "  - FitError: fitting error (m); smaller means a better circle.",
+                "",
+                "Core shapefiles",
+                "---------------",
+                "TreeDiscs (`TreeDiscs.shp` + .dbf/.prj/.shx):",
+                "  - Catalogue of all fitted cross-sections (discs).",
+                "  - Fields:",
+                "    - ID_TREE: tree identifier.",
+                "    - DISC_X / DISC_Y: disc centroid (m).",
+                "    - DISC_H: disc height above ground (m).",
+                "    - DISC_D: stem diameter at that height (cm).",
+                "    - TREE_H: estimated tree height (m).",
+                "    - DISC_ERROR: circle fit error (m).",
+                "    - h/d_index: height-to-diameter ratio.",
+                "    - perimeter: perimeter of the slice footprint (m).",
+                "",
+                "DetectedTrees (`DetectedTrees.shp`, not for iPhone LiDAR / CRP):",
+                "  - One record per tree using the 1.3 m disc (DBH).",
+                "  - Same fields as TreeDiscs; DISC_H is always 1.3 m.",
+                "",
+                "TreeCrowns (`TreeCrowns.shp`):",
+                "  - Crown polygons derived from CHM (watershed).",
+                "  - Fields: CrownID, Area (m^2).",
+                "",
+                "PlotInfo (`PlotInfo.shp`):",
+                "  - Plot footprint derived from the DTM.",
+                "  - Contains Area, TreeCount, BasalArea, TreeVolume, Dg, Hg, etc.",
+                "",
+                "TreeFootprints (`TreeFootprints.shp`, segmentation only):",
+                "  - Ground-level footprint of each segmented tree.",
+                "  - Fields: TreeID, TreeH, Pts, Area.",
+                "",
+                "Main point clouds",
+                "-----------------",
+                "*.<ext> uses the format selected in the GUI (default 'txt').",
+                "DenseCloudTrees.<ext> (segmentation):",
+                "  - Full cloud with assigned TreeID.",
+                "  - Contains: XYZ + original scalars + TreeHeight + TreeID + HeightAboveGround.",
+                "",
+                "CloudTerrainDistances.<ext> (debug):",
+                "  - Stem cores with height above terrain.",
+                "  - Contains: XYZ + TreeID + HeightAboveGround + TreeHeight.",
+                "",
+                "RepopulatedStems.<ext> (debug):",
+                "  - Dense cloud with stem attributes mapped in.",
+                "  - Contains: XYZ + TreeID + HeightAboveGround + TreeHeight.",
+                "",
+                "StemDiscsUnprocessed.<ext> / StemDiscsProcessed.<ext> (debug):",
+                "  - Disc points before/after fitting.",
+                "  - Final columns: disc centre (X,Y), radius, fit error, perimeter.",
+                "",
+                "What each step does (plain language)",
+                "-----------------------------------",
+                "DTM/DSM/CHM:",
+                "  - DTM = ground, DSM = top of vegetation, CHM = canopy height (DSM - DTM).",
+                "Plot area:",
+                "  - The reliable DTM area is used to crop the input cloud.",
+                "Stem detection:",
+                "  - The cloud is flattened and high-density spots are treated as stem candidates.",
+                "Repopulated stems:",
+                "  - Stem info (TreeID, height above ground, tree height) is transferred to the dense cloud.",
+                "Segmentation (AssignPointsToTrees3D):",
+                "  - Each point is assigned to the nearest stem and checked by height.",
+                "Cross sections:",
+                "  - Regular height slices are created and fitted to compute diameters.",
+                "",
+                "Debug exports (standard datasets)",
+                "--------------------------------",
+                "  01SubsamplePointCloud-CloudSS.<ext>         - Subsampled cloud for terrain modelling.",
+                "  02RasterizeZminZmax-CloudMin.<ext>          - Minimum surface samples (DTM base).",
+                "  03SORFilter-CloudSOR.<ext>                  - Filtered minima for the DTM.",
+                "  04PointcloudToRaster-RasterDTM.tif          - Terrain raster (DTM).",
+                "  05DelaunayMesh25D-MeshDTM(.ply)             - DTM mesh.",
+                "  06MeshToShapefile-PlotInfo.*                - Plot footprint.",
+                "  07CropCloudByExtent-CloudCropByDTM.<ext>    - Crop to reliable plot area.",
+                "  08RasterizeZminZmax-CloudMax.<ext>          - Maximum surface samples (DSM base).",
+                "  09PointcloudToRaster-RasterDSM.tif          - DSM raster.",
+                "  10SubtractRasters-RasterCHM.tif             - CHM raster (canopy height).",
+                "  11WatershedCrownDelineation-TreeCrowns.*    - Crown polygons.",
+                "  12FlattenPointCloud-CloudFlat.<ext>         - Flattened cloud for stem detection.",
+                "  13ComputeDensity-CloudDensity.<ext>         - Point density (stem search).",
+                "  14FilterByValue-CloudFilterDensity.<ext>    - Density filtering.",
+                "  15UnflattenPointCloud-CloudPreprocessedStems.<ext> - Stem candidates.",
+                "  16GetTerrainDistances-CloudTerrainDistances.<ext> - Height above ground.",
+                "  17MapScalarFields-CloudRepopulatedStems.<ext> - Attribute transfer to dense cloud.",
+                "  18AssignPointsToTrees3D-DenseCloudTrees.<ext> - Segmentation by TreeID.",
+                "  19ExtractCrossSections-CloudStemDiscsUnprocessed.<ext> - Raw discs.",
+                "  20process_discsall-CloudStemDiscsProcessed.<ext> - Processed discs.",
+                "  20process_discsall-grouped_*.txt              - Optional per-tree disc stacks.",
+                "  20filter_and_transform-TreeDiscs.*          - TreeDiscs shapefile.",
+                "  21filter_disc_height-DetectedTrees.*        - DetectedTrees shapefile.",
+                "",
+                "Debug exports (iPhone LiDAR / CRP)",
+                "---------------------------------",
+                "Same steps but without DSM/CHM and crowns:",
+                "  01SubsamplePointCloud-CloudSS.<ext>",
+                "  02RasterizeZminZmax-CloudMin.<ext>",
+                "  03SORFilter-CloudSOR.<ext>",
+                "  04PointcloudToRaster-RasterDTM.tif",
+                "  05DelaunayMesh25D-MeshDTM(.ply)",
+                "  06MeshToShapefile-PlotInfo.*",
+                "  07CropCloudByExtent-CloudCrop.<ext>",
+                "  08RasterizeZminZmax-CloudMax.<ext>",
+                "  09FlattenPointCloud-CloudFlat.<ext>",
+                "  10ComputeDensity-CloudDensity.<ext>",
+                "  11FilterByValue-CloudFilterDensity.<ext>",
+                "  12UnflattenPointCloud-CloudPreprocessedStems.<ext>",
+                "  13GetTerrainDistances-CloudTerrainDistances.<ext>",
+                "  14MapScalarFields-CloudRepopulatedStems.<ext>",
+                "  15AssignPointsToTrees3D-DenseCloudTrees.<ext>",
+                "  16ExtractCrossSection-CloudStemDiscsUnprocessed.<ext>",
+                "  17process_discsall-CloudStemDiscsProcessed.<ext>",
+                "  18filter_and_transform-TreeDiscs.*",
+                "  19filter_disc_height-DetectedTrees.*",
+                "",
+                (
+                    "Tip: leave Debug disabled for production runs. Enable it only when you need "
+                    "to inspect individual processing stages."
+                ),
+            ]
         return "\n".join(lines)
+
 
     def _handle_outputs_overview_destroy(event):
         nonlocal outputs_overview_window
@@ -6128,16 +7652,39 @@ def DendRobotGUI():
         frame = ttk.Frame(outputs_overview_window)
         frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
+        header = ttk.Frame(frame)
+        header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        header.columnconfigure(1, weight=1)
+
+        lang_var = tk.StringVar(value="English")
+        ttk.Label(header, text="Language:").grid(row=0, column=0, sticky="w")
+        lang_menu = ttk.Combobox(
+            header,
+            textvariable=lang_var,
+            values=["English", "Čeština"],
+            state="readonly",
+            width=10,
+        )
+        lang_menu.grid(row=0, column=1, sticky="w", padx=(6, 0))
+
         text_widget = tk.Text(frame, wrap="word", state="normal")
-        text_widget.insert("1.0", _build_outputs_overview_text())
-        text_widget.configure(state="disabled")
-        text_widget.grid(row=0, column=0, sticky="nsew")
+        text_widget.grid(row=1, column=0, sticky="nsew")
 
         scrollbar = ttk.Scrollbar(frame, orient="vertical", command=text_widget.yview)
-        scrollbar.grid(row=0, column=1, sticky="ns")
+        scrollbar.grid(row=1, column=1, sticky="ns")
         text_widget.configure(yscrollcommand=scrollbar.set)
 
-        frame.rowconfigure(0, weight=1)
+        def _refresh_outputs_overview(*_):
+            lang = "cs" if lang_var.get().lower().startswith("č") else "en"
+            text_widget.config(state="normal")
+            text_widget.delete("1.0", tk.END)
+            text_widget.insert("1.0", _build_outputs_overview_text(lang))
+            text_widget.config(state="disabled")
+
+        lang_menu.bind("<<ComboboxSelected>>", _refresh_outputs_overview)
+        _refresh_outputs_overview()
+
+        frame.rowconfigure(1, weight=1)
         frame.columnconfigure(0, weight=1)
 
         outputs_overview_window.grab_set()
@@ -6203,16 +7750,75 @@ def DendRobotGUI():
     pause_event = threading.Event()
     pause_event.set()  # Initially set to allow processing
 
-    def create_spinbox(parent, row, label_text, var, from_, to, increment, validate_func, tooltip_text, default_value):
+    def create_spinbox(parent, row, label_text, var, from_, to, increment, validate_func, tooltip_text, default_value, integer_only=False):
         last_valid = tk.StringVar(value=str(default_value))
 
-        def on_validate(P):
+        def _is_partial_number(text):
+            text = (text or "").strip()
+            if text == "":
+                return True
+            if integer_only:
+                if text == "-":
+                    return True
+                if text.startswith("-"):
+                    return text[1:].isdigit()
+                return text.isdigit()
+            if text in ("-", ".", "-."):
+                return True
+            if text.count(".") > 1:
+                return False
+            if text.startswith("-"):
+                text = text[1:]
+            if text == "":
+                return True
+            return all((ch.isdigit() or ch == ".") for ch in text)
+
+        def _restore_last():
+            try:
+                val = last_valid.get()
+                var.set(float(val) if "." in val else int(val))
+            except Exception:
+                var.set(default_value)
+
+        def _clamp_value(text):
+            raw = (text or "").strip()
+            if raw == "":
+                return None
+            if not integer_only:
+                raw = raw.replace(",", ".")
+            try:
+                val = int(raw) if integer_only else float(raw)
+            except (TypeError, ValueError):
+                return None
+            try:
+                lo = float(from_)
+                hi = float(to)
+            except (TypeError, ValueError):
+                return val
+            if lo > hi:
+                lo, hi = hi, lo
+            if val < lo:
+                val = lo
+            elif val > hi:
+                val = hi
+            if integer_only:
+                val = int(round(val))
+            return val
+
+        def on_validate(P, V):
+            # Allow partial edits on keypress; enforce range on focusout/forced.
+            if V == "key":
+                return _is_partial_number(P)
             if validate_func(P):
                 last_valid.set(P)
-                return True
             else:
-                parent.after_idle(lambda: var.set(float(last_valid.get()) if '.' in last_valid.get() else int(last_valid.get())))
-                return False
+                clamped = _clamp_value(P)
+                if clamped is None:
+                    parent.after_idle(_restore_last)
+                else:
+                    last_valid.set(str(int(clamped)) if integer_only else str(clamped))
+                    parent.after_idle(lambda: var.set(int(clamped) if integer_only else float(clamped)))
+            return True
 
         label = tk.Label(parent, text=label_text)
         label.grid(row=row, column=0, sticky="w", padx=10, pady=5)
@@ -6220,8 +7826,8 @@ def DendRobotGUI():
         spinbox = ttk.Spinbox(
             parent, from_=from_, to=to, increment=increment,
             textvariable=var,
-            validate="key",
-            validatecommand=(parent.register(on_validate), '%P'),
+            validate="all",
+            validatecommand=(parent.register(on_validate), '%P', '%V'),
             width=8
         )
         spinbox.grid(row=row, column=1, padx=10, pady=5)
@@ -6317,12 +7923,35 @@ def DendRobotGUI():
             XSectionStep = float(XSectionStep_spinbox.get())
             subsamplestep = float(SubsampleStep_spinbox.get())
             epsg = int(epsg_var.get().split()[0])
-            segmentation = segmentation_var.get()
-            debug = debug_var.get()
-            datatype = datatype_menu.get()
+            segmentation_mode = (segmentation_var.get() or "Off").strip()
+            segmentation = segmentation_mode != "Off"
+            segmentation_debug_steps = False
+            if segmentation_mode == "Keep all":
+                segmentation_output = "keep_all"
+            elif segmentation_mode == "Keep trees only":
+                segmentation_output = "keep_trees"
+            elif segmentation_mode == "Keep all steps":
+                segmentation_output = "keep_all"
+                segmentation_debug_steps = True
+            else:
+                segmentation_output = "auto"
+            debug_mode = (debug_var.get() or "Off").strip()
+            debug = debug_mode != "Off"
+            base = (datatype_type_var.get() or "").strip()
+            quality = (datatype_quality_var.get() or "Raw").strip()
+            is_cropped = quality == "Cropped"
+            if base in ("MLS/TLS", "ALS (1000 pts/m^2)"):
+                datatype = f"{base} {quality}"
+            else:
+                datatype = base
             dbhlim = float(maxdbh_spinbox.get())
             chunksize = float(chunksize_spinbox.get())
-            format_choice = outpcdformat_var.get().strip() if debug else ".laz"
+            if debug_mode == "On, .txt":
+                format_choice = "txt"
+            else:
+                format_choice = "laz"
+            if not debug:
+                format_choice = "laz"
             if format_choice.startswith("."):
                 format_choice = format_choice[1:]
             if not format_choice:
@@ -6362,6 +7991,8 @@ def DendRobotGUI():
                 EstimatePlotParameters(
                     pointcloudpath=pointcloudpath,
                     segmentation=segmentation,
+                    segmentation_output=segmentation_output,
+                    segmentation_debug_steps=segmentation_debug_steps,
                     debug=debug,
                     epsg=epsg,
                     subsamplestep=subsamplestep,
@@ -6372,6 +8003,7 @@ def DendRobotGUI():
                     XSectionCount=int(XSectionCount),
                     XSectionStep=float(XSectionStep),
                     datatype=datatype,
+                    cropped=is_cropped,
                     dbhlimit=dbhlim,
                     chunksize=chunksize,
                     outpcdformat=format_choice,
@@ -6683,15 +8315,16 @@ def DendRobotGUI():
         initial_values = {
             'pointcloudpath': "",  # Initial Point Cloud Data Path
             'reevaluate': False,
-            'segmentation': False,
-            'debug': False,
+            'segmentation': "Off",
+            'debug': "Off",
             'epsg': "32633 (UTM-Czechia, Slovakia, Poland, Austria, Croatia, Denmark, Germany)",
             'subsamplestep': 0.05,
             'rasterizestep': 1,
             'XSectionThickness': 0.07,
             'XSectionCount': 3,
             'XSectionStep': 1,
-            'datatype': "MLS/TLS Raw",
+            'datatype_base': "MLS/TLS",
+            'datatype_quality': "Raw",
             'maxdbh' : 1.5,
             'chunksize' : 10,
             'segmentationgap': 0.05,
@@ -6744,7 +8377,9 @@ def DendRobotGUI():
 
         epsg_menu.set( initial_values['epsg'])
 
-        datatype_menu.set(initial_values['datatype'])
+        datatype_type_menu.set(initial_values['datatype_base'])
+        datatype_quality_menu.set(initial_values['datatype_quality'])
+        on_datatype_change()
         
         # Reset all Boolean (checkbox) values
         #reevaluate_var.set(initial_values['reevaluate'])
@@ -6906,8 +8541,36 @@ def DendRobotGUI():
             pause_button.config(text="Pause")
             status_label.config(text="Status: Processing resumed...")
 
-    def on_datatype_change(event):
-        datatype = datatype_var.get()
+    maxdbh_var = None
+    SubsampleStep_var = None
+    chunksize_var = None
+    rasterizestep_var = None
+    segmentationgap_var = None
+    segmentationminheight_var = None
+    XSectionThickness_var = None
+    XSectionCount_var = None
+    XSectionStep_var = None
+
+    def on_datatype_change(event=None):
+        base = (datatype_type_var.get() or "").strip()
+        quality = (datatype_quality_var.get() or "Raw").strip()
+        if base in ("MLS/TLS", "ALS (1000 pts/m^2)"):
+            datatype = f"{base} {quality}"
+        else:
+            datatype = base
+        datatype_quality_menu.configure(state="readonly")
+        if None in (
+            maxdbh_var,
+            SubsampleStep_var,
+            chunksize_var,
+            rasterizestep_var,
+            segmentationgap_var,
+            segmentationminheight_var,
+            XSectionThickness_var,
+            XSectionCount_var,
+            XSectionStep_var,
+        ):
+            return
         defaults = {
             "maxdbh": 1.5,
             "subsample": 0.05,
@@ -6928,7 +8591,7 @@ def DendRobotGUI():
                 "chunksize": 100,
                 "xsection_thickness": 1.0,
             })
-        elif datatype == "ALS (1000 pts/m^2)":
+        elif datatype in ("ALS (1000 pts/m^2) Raw", "ALS (1000 pts/m^2) Cropped"):
             defaults.update({
                 "chunksize": 100,
                 "segmentation_gap": 0.2,
@@ -7007,12 +8670,656 @@ def DendRobotGUI():
         else:
             display_value = next(
                 (label for label, value in EPSG_OPTIONS.items() if value == epsg_code),
-                str(epsg_code),
+                None,
             )
+            if display_value is None:
+                try:
+                    crs = CRS.from_epsg(epsg_code)
+                    crs_name = crs.name
+                    display_value = f"{epsg_code} ({crs_name})" if crs_name else str(epsg_code)
+                except Exception:
+                    display_value = str(epsg_code)
             if display_value != user_input:
                 epsg_var.set(display_value)
     ####Function Menu Functions####
 # ──────────────────────────────────────────────
+    class ZonalStatsDialog(simpledialog.Dialog):
+        """Dialog for computing zonal statistics from rasters or point clouds."""
+
+        STAT_OPTIONS = [
+            ("min", "Minimum"),
+            ("max", "Maximum"),
+            ("mean", "Mean"),
+            ("sum", "Sum"),
+            ("std", "Std. dev."),
+            ("var", "Variance"),
+            ("count", "Count"),
+            ("median", "Median"),
+            ("percentile", "Percentile"),
+            ("count_gt", "Count > x"),
+            ("count_lt", "Count < x"),
+            ("count_eq", "Count = x"),
+        ]
+
+        def body(self, master):
+            self.polygons_var = tk.StringVar()
+            self.input_kind_var = tk.StringVar(value="pointcloud")
+            self.input_path_var = tk.StringVar()
+            self.threshold_var = tk.StringVar(value="0")
+            self.percentile_var = tk.StringVar(value="90")
+            self.all_touched_var = tk.BooleanVar(value=True)
+
+            self.output_mode_var = tk.StringVar(value="copy")
+            self.output_path_var = tk.StringVar()
+
+            self._value_options = []
+            self._value_labels = []
+            self._row_by_index = {}
+            self._x_idx = 0
+            self._y_idx = 1
+            self.progress_var = tk.StringVar(value="Idle")
+            self._running = False
+
+            # Polygons
+            polygons_label = tk.Label(master, text="Input polygons (SHP/GPKG):")
+            polygons_label.grid(row=0, column=0, sticky="w")
+            tk.Entry(master, textvariable=self.polygons_var, width=60).grid(row=0, column=1, sticky="ew")
+            tk.Button(master, text="Browse…", command=self._browse_polygons).grid(row=0, column=2, padx=(6, 0))
+            create_tooltip(polygons_label, "Polygon layer to receive the computed statistics.")
+
+            # Input type
+            kind_label = tk.Label(master, text="Input type:")
+            kind_label.grid(row=1, column=0, sticky="w", pady=(6, 0))
+            kind_frame = tk.Frame(master)
+            kind_frame.grid(row=1, column=1, columnspan=2, sticky="w", pady=(6, 0))
+            tk.Radiobutton(kind_frame, text="Point cloud", variable=self.input_kind_var, value="pointcloud", command=self._on_kind_change).grid(row=0, column=0, sticky="w")
+            tk.Radiobutton(kind_frame, text="Raster", variable=self.input_kind_var, value="raster", command=self._on_kind_change).grid(row=0, column=1, sticky="w", padx=(12, 0))
+
+            # Input path
+            input_label = tk.Label(master, text="Input point cloud / raster:")
+            input_label.grid(row=2, column=0, sticky="w")
+            tk.Entry(master, textvariable=self.input_path_var, width=60).grid(row=2, column=1, sticky="ew")
+            tk.Button(master, text="Browse…", command=self._browse_input).grid(row=2, column=2, padx=(6, 0))
+            create_tooltip(input_label, "Raster band values or point-cloud scalar values will be sampled inside each polygon.")
+
+            # Value field / band
+            value_label = tk.Label(master, text="Scalar field(s) / raster band(s):")
+            value_label.grid(row=3, column=0, sticky="w", pady=(6, 0))
+            value_frame = tk.Frame(master)
+            value_frame.grid(row=3, column=1, columnspan=2, sticky="nsew", pady=(6, 0))
+            value_frame.columnconfigure(0, weight=1)
+            value_frame.rowconfigure(0, weight=1)
+
+            list_frame = tk.Frame(value_frame)
+            list_frame.grid(row=0, column=0, sticky="nsew")
+            list_frame.columnconfigure(0, weight=1)
+            list_frame.rowconfigure(0, weight=1)
+
+            self.value_listbox = tk.Listbox(
+                list_frame,
+                selectmode=tk.EXTENDED,
+                exportselection=False,
+                height=8,
+                width=46,
+            )
+            self.value_listbox.grid(row=0, column=0, sticky="nsew")
+            value_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.value_listbox.yview)
+            value_scroll.grid(row=0, column=1, sticky="ns")
+            self.value_listbox.configure(yscrollcommand=value_scroll.set)
+
+            value_btns = tk.Frame(value_frame)
+            value_btns.grid(row=0, column=1, sticky="ns", padx=(6, 0))
+            tk.Button(value_btns, text="Load", width=12, command=self._refresh_value_options).grid(row=0, column=0, pady=(0, 4))
+            tk.Button(value_btns, text="Select RGB", width=12, command=self._select_rgb_channels).grid(row=1, column=0, pady=(0, 4))
+            tk.Button(value_btns, text="Select All", width=12, command=self._select_all_channels).grid(row=2, column=0, pady=(0, 4))
+            tk.Button(value_btns, text="Clear", width=12, command=self._clear_channel_selection).grid(row=3, column=0)
+            create_tooltip(value_label, "Multi-select channels (Ctrl/Shift) or use Select RGB.")
+
+            # Raster options
+            self.raster_opts_frame = tk.Frame(master)
+            self.raster_opts_frame.grid(row=4, column=0, columnspan=3, sticky="w")
+            self.all_touched_check = tk.Checkbutton(
+                self.raster_opts_frame,
+                text="Raster: count all touched pixels",
+                variable=self.all_touched_var,
+            )
+            self.all_touched_check.grid(row=0, column=0, sticky="w", pady=(2, 0))
+
+            # Statistics selection
+            stats_label = tk.Label(master, text="Statistics:")
+            stats_label.grid(row=5, column=0, sticky="nw", pady=(8, 0))
+            stats_frame = tk.Frame(master)
+            stats_frame.grid(row=5, column=1, columnspan=2, sticky="w", pady=(8, 0))
+
+            self.stat_vars = {}
+            default_on = set()
+            self.percentile_spin = None
+            self.threshold_entry = None
+            percentile_idx = next(
+                (i for i, (k, _) in enumerate(self.STAT_OPTIONS) if k == "percentile"),
+                0,
+            )
+            self._percentile_row = percentile_idx // 3
+            self._percentile_col = percentile_idx % 3
+            for idx, (key, label) in enumerate(self.STAT_OPTIONS):
+                var = tk.BooleanVar(value=key in default_on)
+                self.stat_vars[key] = var
+                row = idx // 3
+                col = idx % 3
+                if key == "percentile":
+                    pct_frame = tk.Frame(stats_frame)
+                    pct_frame.grid(row=row, column=col, sticky="w", padx=(0, 12))
+                    pct_check = tk.Checkbutton(
+                        pct_frame,
+                        text=label,
+                        variable=var,
+                        command=self._update_threshold_state,
+                    )
+                    pct_check.grid(row=0, column=0, sticky="w")
+                    self.percentile_spin = ttk.Spinbox(
+                        pct_frame,
+                        from_=0,
+                        to=100,
+                        increment=1,
+                        width=6,
+                        textvariable=self.percentile_var,
+                    )
+                    self.percentile_spin.grid(row=0, column=1, sticky="w", padx=(4, 0))
+                elif key == "count_eq":
+                    count_frame = tk.Frame(stats_frame)
+                    count_frame.grid(row=row, column=col, sticky="w", padx=(0, 12))
+                    tk.Checkbutton(
+                        count_frame,
+                        text=label,
+                        variable=var,
+                        command=self._update_threshold_state,
+                    ).pack(side=tk.LEFT)
+                    threshold_vcmd = (master.register(self._validate_numeric_entry), "%P")
+                    self.threshold_entry = ttk.Entry(
+                        count_frame,
+                        textvariable=self.threshold_var,
+                        width=8,
+                        validate="key",
+                        validatecommand=threshold_vcmd,
+                    )
+                    self.threshold_entry.pack(side=tk.LEFT, padx=(6, 0))
+                    create_tooltip(
+                        self.threshold_entry,
+                        "Used by count > x, count < x, and count = x.",
+                    )
+                else:
+                    tk.Checkbutton(
+                        stats_frame,
+                        text=label,
+                        variable=var,
+                        command=self._update_threshold_state,
+                    ).grid(row=row, column=col, sticky="w", padx=(0, 12))
+
+            # Output mode
+            output_label = tk.Label(master, text="Write results:")
+            output_label.grid(row=6, column=0, sticky="w", pady=(8, 0))
+            output_frame = tk.Frame(master)
+            output_frame.grid(row=6, column=1, columnspan=2, sticky="w", pady=(8, 0))
+            tk.Radiobutton(
+                output_frame,
+                text="Overwrite original polygons file",
+                variable=self.output_mode_var,
+                value="overwrite",
+                command=self._update_output_state,
+            ).grid(row=0, column=0, sticky="w")
+            tk.Radiobutton(
+                output_frame,
+                text="Create a copy",
+                variable=self.output_mode_var,
+                value="copy",
+                command=self._update_output_state,
+            ).grid(row=0, column=1, sticky="w", padx=(12, 0))
+
+            # Output path
+            outpath_label = tk.Label(master, text="Output polygons path:")
+            outpath_label.grid(row=7, column=0, sticky="w")
+            self.output_entry = tk.Entry(master, textvariable=self.output_path_var, width=60)
+            self.output_entry.grid(row=7, column=1, sticky="ew")
+            self.output_browse_btn = tk.Button(master, text="Browse…", command=self._browse_output)
+            self.output_browse_btn.grid(row=7, column=2, padx=(6, 0))
+            create_tooltip(outpath_label, "Used only when creating a copy.")
+
+            ttk.Label(master, textvariable=self.progress_var, foreground="gray").grid(
+                row=8, column=0, columnspan=3, sticky="w", pady=(8, 0)
+            )
+
+            master.columnconfigure(1, weight=1)
+
+            self._on_kind_change()
+            self._update_output_state()
+            self._update_threshold_state()
+            return None
+
+        def buttonbox(self):
+            box = tk.Frame(self)
+            self.start_button = ttk.Button(box, text="Start", command=self.ok)
+            self.start_button.pack(side=tk.LEFT, padx=5, pady=5)
+            self.close_button = ttk.Button(box, text="Close", command=self._on_close)
+            self.close_button.pack(side=tk.LEFT, padx=5, pady=5)
+            self.bind("<Return>", self.ok)
+            self.bind("<Escape>", lambda event: self._on_close())
+            box.pack()
+
+        def _on_close(self):
+            if self._running:
+                if not messagebox.askyesno(
+                    "Processing still running",
+                    "Zonal statistics are still running. Close this window anyway?",
+                    parent=self,
+                ):
+                    return
+            try:
+                self.destroy()
+            except TclError:
+                pass
+
+        def _browse_polygons(self):
+            filename = filedialog.askopenfilename(
+                filetypes=[
+                    ("Vector polygons", "*.shp *.gpkg"),
+                    ("ESRI Shapefile", "*.shp"),
+                    ("GeoPackage", "*.gpkg"),
+                    ("All files", "*.*"),
+                ]
+            )
+            if filename:
+                self.polygons_var.set(os.path.normpath(filename))
+
+        def _browse_input(self):
+            if self.input_kind_var.get() == "raster":
+                filetypes = [
+                    ("Raster", "*.tif *.tiff *.img *.vrt"),
+                    ("GeoTIFF", "*.tif *.tiff"),
+                    ("All files", "*.*"),
+                ]
+            else:
+                filetypes = [
+                    ("Point clouds", "*.las *.laz *.ply *.pcd *.txt *.xyz *.asc *.pts *.xyzn *.xyzrgb *.e57 *.csv"),
+                    ("All files", "*.*"),
+                ]
+            filename = filedialog.askopenfilename(filetypes=filetypes)
+            if filename:
+                self.input_path_var.set(os.path.normpath(filename))
+                self._refresh_value_options()
+
+        def _browse_output(self):
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".gpkg",
+                filetypes=[
+                    ("GeoPackage", "*.gpkg"),
+                    ("ESRI Shapefile", "*.shp"),
+                    ("All files", "*.*"),
+                ],
+            )
+            if filename:
+                self.output_path_var.set(os.path.normpath(filename))
+
+        def _on_kind_change(self):
+            is_raster = self.input_kind_var.get() == "raster"
+            try:
+                self.all_touched_check.configure(state=("normal" if is_raster else "disabled"))
+            except TclError:
+                pass
+            if self.input_path_var.get().strip():
+                self._refresh_value_options()
+
+        def _refresh_value_options(self):
+            path = self.input_path_var.get().strip()
+            if not path:
+                return
+            try:
+                if self.input_kind_var.get() == "raster":
+                    options = _enumerate_raster_bands(path)
+                    self._x_idx, self._y_idx = 0, 1
+                else:
+                    options, x_idx, y_idx = _enumerate_pointcloud_fields(path)
+                    self._x_idx, self._y_idx = x_idx, y_idx
+            except Exception as exc:
+                messagebox.showerror("Field discovery failed", f"Could not list fields/bands:\n{exc}")
+                return
+
+            labels = [opt["label"] for opt in options]
+            self._value_options = options
+            self._value_labels = labels
+            self._row_by_index = {opt["index"]: row for row, opt in enumerate(options)}
+
+            try:
+                self.value_listbox.delete(0, tk.END)
+                for label in labels:
+                    self.value_listbox.insert(tk.END, label)
+            except TclError:
+                return
+
+            default_indices = self._default_value_indices()
+            self._select_indices(default_indices, extend=False)
+
+        def _default_value_indices(self):
+            if not self._value_options:
+                return []
+            if self.input_kind_var.get() == "raster":
+                return [self._value_options[0]["index"]]
+            non_xy = [
+                opt["index"]
+                for opt in self._value_options
+                if opt["index"] not in {self._x_idx, self._y_idx}
+            ]
+            if not non_xy:
+                return []
+            if 2 in non_xy:
+                return [2]
+            return [non_xy[0]]
+
+        def _select_indices(self, indices, extend=False):
+            if not indices:
+                return
+            try:
+                if not extend:
+                    self.value_listbox.selection_clear(0, tk.END)
+                for idx in indices:
+                    row = self._row_by_index.get(int(idx))
+                    if row is not None:
+                        self.value_listbox.selection_set(row)
+                first_row = self._row_by_index.get(int(indices[0]))
+                if first_row is not None:
+                    self.value_listbox.see(first_row)
+            except TclError:
+                pass
+
+        def _get_selected_value_indices(self):
+            try:
+                rows = list(self.value_listbox.curselection())
+            except TclError:
+                return []
+            indices = []
+            for row in rows:
+                if 0 <= row < len(self._value_options):
+                    indices.append(int(self._value_options[row]["index"]))
+            # Filter out XY for point clouds.
+            if self.input_kind_var.get() != "raster":
+                indices = [idx for idx in indices if idx not in {self._x_idx, self._y_idx}]
+            return indices
+
+        def _select_rgb_channels(self):
+            if not self._value_options:
+                self._refresh_value_options()
+            if not self._value_options:
+                return
+
+            rgb_indices = []
+            if self.input_kind_var.get() == "raster":
+                available = {opt["index"] for opt in self._value_options}
+                rgb_indices = [idx for idx in (1, 2, 3) if idx in available]
+            else:
+                def _match_token(token):
+                    token = token.lower()
+                    for opt in self._value_options:
+                        name = str(opt.get("name", "")).lower()
+                        if token == name or token in name:
+                            return int(opt["index"])
+                    return None
+
+                red_idx = _match_token("red") or _match_token("r")
+                green_idx = _match_token("green") or _match_token("g")
+                blue_idx = _match_token("blue") or _match_token("b")
+                if red_idx is not None and green_idx is not None and blue_idx is not None:
+                    rgb_indices = [red_idx, green_idx, blue_idx]
+
+            if not rgb_indices:
+                non_xy = [
+                    opt["index"]
+                    for opt in self._value_options
+                    if opt["index"] not in {self._x_idx, self._y_idx}
+                ]
+                rgb_indices = [int(idx) for idx in non_xy[:3]]
+
+            self._select_indices(rgb_indices, extend=False)
+
+        def _select_all_channels(self):
+            if not self._value_options:
+                self._refresh_value_options()
+            if not self._value_options:
+                return
+            if self.input_kind_var.get() == "raster":
+                indices = [int(opt["index"]) for opt in self._value_options]
+            else:
+                indices = [
+                    int(opt["index"])
+                    for opt in self._value_options
+                    if opt["index"] not in {self._x_idx, self._y_idx}
+                ]
+            self._select_indices(indices, extend=False)
+
+        def _clear_channel_selection(self):
+            try:
+                self.value_listbox.selection_clear(0, tk.END)
+            except TclError:
+                pass
+
+        @staticmethod
+        def _is_partial_number(text):
+            text = (text or "").strip()
+            if text in ("", "-", ".", "-.", ",", "-,"):
+                return True
+            text = text.replace(",", ".")
+            if text.count(".") > 1:
+                return False
+            if text.startswith("-"):
+                text = text[1:]
+            if text == "":
+                return True
+            return all((ch.isdigit() or ch == ".") for ch in text)
+
+        def _validate_numeric_entry(self, proposed):
+            return self._is_partial_number(proposed)
+
+        def _update_output_state(self):
+            copy_mode = self.output_mode_var.get() == "copy"
+            state = "normal" if copy_mode else "disabled"
+            try:
+                self.output_entry.configure(state=state)
+                self.output_browse_btn.configure(state=state)
+            except TclError:
+                pass
+
+        def _update_threshold_state(self):
+            needs_threshold = any(
+                self.stat_vars[key].get() for key in ("count_gt", "count_lt", "count_eq")
+            )
+            state = "normal" if needs_threshold else "disabled"
+            needs_percentile = bool(self.stat_vars.get("percentile") and self.stat_vars["percentile"].get())
+            pct_state = "normal" if needs_percentile else "disabled"
+            try:
+                if self.threshold_entry is not None:
+                    self.threshold_entry.configure(state=state)
+                if self.percentile_spin is not None:
+                    self.percentile_spin.configure(state=pct_state)
+            except TclError:
+                pass
+
+        def _update_progress(self, completed, total):
+            try:
+                if not self.winfo_exists():
+                    return
+                total_txt = str(int(total)) if total else "?"
+                self.progress_var.set(f"Progress: {int(completed)} / {total_txt}")
+            except TclError:
+                pass
+
+        def _set_running(self, running):
+            self._running = bool(running)
+            state = tk.DISABLED if self._running else tk.NORMAL
+            try:
+                if hasattr(self, "start_button") and self.start_button:
+                    self.start_button.configure(state=state)
+            except TclError:
+                pass
+
+        def ok(self, event=None):
+            if self._running:
+                return
+            if not self.validate():
+                return
+            params = getattr(self, "_validated_payload", None)
+            if not params:
+                return
+            self._start_processing(params)
+
+        def _start_processing(self, params):
+            self.progress_var.set("Progress: 0 / ?")
+
+            def progress_callback(done, total):
+                if not self.winfo_exists():
+                    return
+                enqueue_ui(self._update_progress, done, total)
+
+            def worker():
+                result = ZonalStatistics(
+                    polygons_path=params["polygons_path"],
+                    input_path=params["input_path"],
+                    input_kind=params["input_kind"],
+                    value_index=params.get("value_indices") or params["value_index"],
+                    stats=params["stats"],
+                    threshold=params["threshold"],
+                    percentile_value=params.get("percentile_value"),
+                    overwrite=bool(params["overwrite"]),
+                    output_path=params["output_path"],
+                    all_touched=bool(params["all_touched"]),
+                    progress_callback=progress_callback,
+                )
+                return result
+
+            def on_success(info):
+                self._set_running(False)
+                polygons_done = info.get("polygons")
+                if polygons_done:
+                    self._update_progress(polygons_done, polygons_done)
+
+                fields = info.get("fields") or []
+                fields_text = ", ".join(fields[:8])
+                if len(fields) > 8:
+                    fields_text += ", …"
+                channels = info.get("value_indices") or []
+                msg = (
+                    f"Processed {info.get('polygons', 0)} polygons.\n"
+                    f"Output:\n{info.get('output_path', '')}"
+                )
+                if channels:
+                    msg += f"\nChannels: {channels}"
+                if fields_text:
+                    msg += f"\n\nAdded fields:\n{fields_text}"
+                messagebox.showinfo("Zonal Statistics Complete", msg, parent=self)
+
+            def on_failure(exc):
+                self._set_running(False)
+                if self.winfo_exists():
+                    try:
+                        self.progress_var.set("Progress: failed")
+                    except TclError:
+                        pass
+                messagebox.showerror("Error", f"Zonal statistics failed:\n{exc}", parent=self)
+
+            self._set_running(True)
+            run_background_task(
+                start_status="Status: Computing zonal statistics...",
+                success_status="Status: Zonal statistics completed successfully.",
+                failure_status="Status: Zonal statistics failed.",
+                worker_fn=worker,
+                success_callback=on_success,
+                failure_callback=on_failure,
+            )
+
+        def validate(self):
+            polygons_path = self.polygons_var.get().strip()
+            if not polygons_path:
+                messagebox.showerror("Missing input", "Select an input polygon layer.")
+                return False
+            if not os.path.exists(polygons_path):
+                messagebox.showerror("Invalid path", "Polygon path does not exist.")
+                return False
+
+            input_path = self.input_path_var.get().strip()
+            if not input_path:
+                messagebox.showerror("Missing input", "Select an input point cloud or raster.")
+                return False
+            if not os.path.exists(input_path):
+                messagebox.showerror("Invalid path", "Input path does not exist.")
+                return False
+
+            selected_stats = [key for key, var in self.stat_vars.items() if var.get()]
+            if not selected_stats:
+                messagebox.showerror("Missing statistics", "Select at least one statistic.")
+                return False
+
+            value_indices = self._get_selected_value_indices()
+            if not value_indices:
+                # Try to populate and select a sensible default.
+                self._refresh_value_options()
+                value_indices = self._get_selected_value_indices()
+            if not value_indices:
+                messagebox.showerror("Missing field", "Choose at least one scalar field or raster band.")
+                return False
+
+            needs_threshold = any(s in selected_stats for s in ("count_gt", "count_lt", "count_eq"))
+            threshold_value = None
+            if needs_threshold:
+                raw_thr = self.threshold_var.get().strip().replace(",", ".")
+                if not raw_thr:
+                    messagebox.showerror("Missing threshold", "Enter a threshold value x for count statistics.")
+                    return False
+                try:
+                    threshold_value = float(raw_thr)
+                except ValueError:
+                    messagebox.showerror("Invalid threshold", "Threshold must be a number.")
+                    return False
+
+            needs_percentile = "percentile" in selected_stats
+            percentile_value = None
+            if needs_percentile:
+                raw_pct = self.percentile_var.get().strip().replace(",", ".")
+                if not raw_pct:
+                    messagebox.showerror("Missing percentile", "Enter a percentile value in [0, 100].")
+                    return False
+                try:
+                    percentile_value = float(raw_pct)
+                except ValueError:
+                    messagebox.showerror("Invalid percentile", "Percentile must be a number in [0, 100].")
+                    return False
+                if (not np.isfinite(percentile_value)) or percentile_value < 0 or percentile_value > 100:
+                    messagebox.showerror("Invalid percentile", "Percentile must be within [0, 100].")
+                    return False
+
+            if self.output_mode_var.get() == "copy":
+                out_path = self.output_path_var.get().strip()
+                if not out_path:
+                    messagebox.showerror("Missing output", "Provide an output path for the copy.")
+                    return False
+
+            self._validated_payload = {
+                "polygons_path": os.path.normpath(polygons_path),
+                "input_kind": self.input_kind_var.get(),
+                "input_path": os.path.normpath(input_path),
+                "value_indices": [int(v) for v in value_indices],
+                "value_index": int(value_indices[0]) if value_indices else None,
+                "stats": selected_stats,
+                "threshold": threshold_value,
+                "percentile_value": percentile_value,
+                "overwrite": self.output_mode_var.get() == "overwrite",
+                "output_path": os.path.normpath(self.output_path_var.get().strip()) if self.output_path_var.get().strip() else None,
+                "all_touched": bool(self.all_touched_var.get()),
+            }
+            return True
+
+        def apply(self):
+            self.result = getattr(self, "_validated_payload", None)
+
+    def zonal_statistics_dialog():
+        ZonalStatsDialog(root, title="Zonal Statistics")
+
     class MapDialog(simpledialog.Dialog):
         def body(self, master):
             # Source
@@ -7295,6 +9602,324 @@ def DendRobotGUI():
             success_callback=on_success,
             failure_callback=on_failure,
         )
+
+    class SlicePointCloudDialog(tk.Toplevel):
+        """Dialog for slicing point clouds into Z-ranges and exporting slices (non-modal)."""
+
+        DEFAULT_EXTS = "las,laz,ply,pcd,txt,xyz,asc,e57"
+
+        def __init__(self, master):
+            super().__init__(master)
+            self.title("Slice Point Cloud")
+            self.resizable(False, False)
+            self.transient(master)
+            self.grab_set()
+            self.result = None
+            self._running = False
+
+            container = ttk.Frame(self, padding=8)
+            container.grid(row=0, column=0, sticky="nsew")
+
+            self.mode_var = tk.StringVar(value="file")
+            self.file_var = tk.StringVar()
+            self.folder_var = tk.StringVar()
+            self.ext_var = tk.StringVar(value=self.DEFAULT_EXTS)
+
+            self.slice_count_var = tk.IntVar(value=2)
+            self.output_mode_var = tk.StringVar(value="points")
+            self.grid_size_var = tk.StringVar(value="0.1")
+            self.epsg_var = tk.StringVar(value="32633")
+            self.hillshade_var = tk.BooleanVar(value=False)
+            self.stack_var = tk.BooleanVar(value=False)
+            self.output_dir_var = tk.StringVar()
+            self.status_var = tk.StringVar(value="Idle")
+
+            ttk.Label(container, text="Input:").grid(row=0, column=0, sticky="w", pady=(2, 0))
+            input_frame = ttk.Frame(container)
+            input_frame.grid(row=0, column=1, columnspan=3, sticky="ew", pady=(2, 0))
+            input_frame.columnconfigure(1, weight=1)
+
+            tk.Radiobutton(input_frame, text="Single file", variable=self.mode_var, value="file", command=self._update_mode_state).grid(row=0, column=0, sticky="w")
+            tk.Radiobutton(input_frame, text="Folder", variable=self.mode_var, value="folder", command=self._update_mode_state).grid(row=0, column=1, sticky="w", padx=(10, 0))
+
+            ttk.Label(container, text="File path:").grid(row=1, column=0, sticky="w")
+            self.file_entry = ttk.Entry(container, textvariable=self.file_var, width=50)
+            self.file_entry.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(0, 5))
+            ttk.Button(container, text="Browse", command=self._browse_file).grid(row=1, column=3, sticky="ew")
+
+            ttk.Label(container, text="Folder:").grid(row=2, column=0, sticky="w")
+            self.folder_entry = ttk.Entry(container, textvariable=self.folder_var, width=50)
+            self.folder_entry.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(0, 5))
+            ttk.Button(container, text="Browse", command=self._browse_folder).grid(row=2, column=3, sticky="ew")
+
+            ttk.Label(container, text="Extensions (comma):").grid(row=3, column=0, sticky="w", pady=(2, 0))
+            self.ext_entry = ttk.Entry(container, textvariable=self.ext_var, width=20)
+            self.ext_entry.grid(row=3, column=1, sticky="w", pady=(2, 0))
+
+            ttk.Label(container, text="Number of slices:").grid(row=4, column=0, sticky="w", pady=(6, 0))
+            self.slice_spin = ttk.Spinbox(
+                container,
+                from_=1,
+                to=50,
+                width=6,
+                textvariable=self.slice_count_var,
+                command=self._refresh_slice_rows,
+            )
+            self.slice_spin.grid(row=4, column=1, sticky="w", pady=(6, 0))
+
+            self.slice_frame = ttk.Frame(container)
+            self.slice_frame.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(4, 6))
+            for col in (0, 1, 2):
+                self.slice_frame.columnconfigure(col, weight=0)
+            self.slice_rows = []
+            self._refresh_slice_rows()
+
+            ttk.Label(container, text="Output type:").grid(row=6, column=0, sticky="w")
+            out_frame = ttk.Frame(container)
+            out_frame.grid(row=6, column=1, columnspan=3, sticky="w")
+            tk.Radiobutton(out_frame, text="Point clouds", variable=self.output_mode_var, value="points", command=self._update_mode_state).grid(row=0, column=0, sticky="w")
+            tk.Radiobutton(out_frame, text="Rasters", variable=self.output_mode_var, value="raster", command=self._update_mode_state).grid(row=0, column=1, sticky="w", padx=(10, 0))
+
+            self.raster_opts = ttk.Frame(container)
+            self.raster_opts.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(4, 0))
+            ttk.Label(self.raster_opts, text="Raster cell size:").grid(row=0, column=0, sticky="w")
+            self.grid_entry = ttk.Spinbox(self.raster_opts, textvariable=self.grid_size_var, width=8, from_=0.1, to=1e6, increment=0.1)
+            self.grid_entry.grid(row=0, column=1, sticky="w", padx=(2, 10))
+            ttk.Label(self.raster_opts, text="EPSG:").grid(row=0, column=2, sticky="w")
+            self.epsg_entry = ttk.Entry(self.raster_opts, textvariable=self.epsg_var, width=10)
+            self.epsg_entry.grid(row=0, column=3, sticky="w", padx=(2, 10))
+
+            self.hillshade_check = ttk.Checkbutton(self.raster_opts, text="Create 8-dir hillshade", variable=self.hillshade_var)
+            self.hillshade_check.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+            self.stack_check = ttk.Checkbutton(self.raster_opts, text="Stack slice rasters", variable=self.stack_var)
+            self.stack_check.grid(row=1, column=2, columnspan=2, sticky="w", pady=(4, 0))
+
+            ttk.Label(container, text="Output folder:").grid(row=8, column=0, sticky="w", pady=(6, 0))
+            self.output_entry = ttk.Entry(container, textvariable=self.output_dir_var, width=50)
+            self.output_entry.grid(row=8, column=1, columnspan=2, sticky="ew", padx=(0, 5), pady=(6, 0))
+            ttk.Button(container, text="Browse", command=self._browse_output).grid(row=8, column=3, sticky="ew", pady=(6, 0))
+
+            button_frame = ttk.Frame(container)
+            button_frame.grid(row=9, column=0, columnspan=4, pady=(10, 0), sticky="e")
+            self.run_button = ttk.Button(button_frame, text="Start slicing", command=self._on_run)
+            self.run_button.grid(row=0, column=0, padx=(0, 8))
+            ttk.Button(button_frame, text="Close", command=self.destroy).grid(row=0, column=1)
+
+            ttk.Label(container, textvariable=self.status_var, foreground="gray").grid(row=10, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+            self._update_mode_state()
+            self.file_entry.focus_set()
+
+        def _refresh_slice_rows(self):
+            # Preserve already-entered values before rebuilding widgets.
+            existing_values = []
+            for zmin_var, zmax_var in self.slice_rows:
+                try:
+                    existing_values.append((zmin_var.get(), zmax_var.get()))
+                except tk.TclError:
+                    existing_values.append(("0", "0"))
+
+            for child in self.slice_frame.winfo_children():
+                child.destroy()
+            self.slice_rows.clear()
+            count = max(1, int(self.slice_count_var.get()))
+            ttk.Label(self.slice_frame, text="Slice").grid(row=0, column=0, sticky="w")
+            ttk.Label(self.slice_frame, text="Z min").grid(row=0, column=1, sticky="w", padx=(0, 4))
+            ttk.Label(self.slice_frame, text="Z max").grid(row=0, column=2, sticky="w")
+            for idx in range(count):
+                ttk.Label(self.slice_frame, text=f"{idx+1}:").grid(row=idx+1, column=0, sticky="w")
+                zmin_default = existing_values[idx][0] if idx < len(existing_values) else "0"
+                zmax_default = existing_values[idx][1] if idx < len(existing_values) else str((idx + 1) * 1.0)
+                zmin_var = tk.StringVar(value=zmin_default)
+                zmax_var = tk.StringVar(value=zmax_default)
+                ttk.Spinbox(self.slice_frame, textvariable=zmin_var, width=8, from_=-1e6, to=1e6, increment=0.1).grid(row=idx+1, column=1, sticky="w", padx=(0, 4))
+                ttk.Spinbox(self.slice_frame, textvariable=zmax_var, width=8, from_=-1e6, to=1e6, increment=0.1).grid(row=idx+1, column=2, sticky="w")
+                self.slice_rows.append((zmin_var, zmax_var))
+
+        def _browse_file(self):
+            fn = filedialog.askopenfilename(
+                filetypes=[("Point clouds", "*.pcd *.ply *.txt *.xyz *.las *.laz *.asc *.pts *.xyzn *.xyzrgb *.e57"), ("All files", "*.*")]
+            )
+            if fn:
+                self.file_var.set(os.path.normpath(fn))
+
+        def _browse_folder(self):
+            fn = filedialog.askdirectory()
+            if fn:
+                self.folder_var.set(os.path.normpath(fn))
+
+        def _browse_output(self):
+            fn = filedialog.askdirectory()
+            if fn:
+                self.output_dir_var.set(os.path.normpath(fn))
+
+        def _update_mode_state(self):
+            file_state = "normal" if self.mode_var.get() == "file" else "disabled"
+            folder_state = "normal" if self.mode_var.get() == "folder" else "disabled"
+            for widget in (self.file_entry,):
+                widget.config(state=file_state)
+            for widget in (self.folder_entry, self.ext_entry):
+                widget.config(state=folder_state)
+
+            raster_state = "normal" if self.output_mode_var.get() == "raster" else "disabled"
+            for widget in (self.grid_entry, self.epsg_entry, self.hillshade_check, self.stack_check):
+                widget.config(state=raster_state)
+
+        def _collect_params(self):
+            mode = self.mode_var.get()
+            file_path = self.file_var.get().strip()
+            folder_path = self.folder_var.get().strip()
+            output_dir = self.output_dir_var.get().strip()
+
+            if mode == "file":
+                if not file_path or not os.path.isfile(file_path):
+                    raise ValueError("Select a valid input file.")
+            else:
+                if not folder_path or not os.path.isdir(folder_path):
+                    raise ValueError("Select a valid folder.")
+
+            ranges = []
+            for zmin_var, zmax_var in self.slice_rows:
+                zmin = float(zmin_var.get())
+                zmax = float(zmax_var.get())
+                ranges.append((zmin, zmax))
+            if not ranges:
+                raise ValueError("Define at least one slice.")
+
+            output_mode = self.output_mode_var.get()
+            grid_size = float(self.grid_size_var.get()) if output_mode == "raster" else None
+            epsg = int(self.epsg_var.get()) if output_mode == "raster" else None
+            if output_mode == "raster" and grid_size <= 0:
+                raise ValueError("Raster cell size must be positive.")
+
+            if not output_dir:
+                raise ValueError("Select an output folder.")
+
+            if mode == "folder":
+                ext_raw = self.ext_var.get().strip()
+                ext_list = [e.strip().lower() for e in ext_raw.split(",") if e.strip()]
+                if not ext_list:
+                    ext_list = self.DEFAULT_EXTS.split(",")
+            else:
+                ext_list = []
+
+            return {
+                "mode": mode,
+                "file": os.path.normpath(file_path) if file_path else None,
+                "folder": os.path.normpath(folder_path) if folder_path else None,
+                "extensions": ext_list,
+                "z_ranges": ranges,
+                "output_mode": output_mode,
+                "grid_size": grid_size,
+                "epsg": epsg,
+                "hillshade": bool(self.hillshade_var.get()),
+                "stack": bool(self.stack_var.get()),
+                "output_dir": os.path.normpath(output_dir),
+            }
+
+        def _on_run(self):
+            if self._running:
+                return
+            try:
+                params = self._collect_params()
+            except Exception as exc:
+                messagebox.showerror("Invalid input", str(exc), parent=self)
+                return
+
+            output_dir = params["output_dir"]
+            os.makedirs(output_dir, exist_ok=True)
+            start_time = time.time()
+
+            def _fmt_duration(seconds):
+                m, s = divmod(seconds, 60)
+                h, m = divmod(m, 60)
+                if h >= 1:
+                    return f"{int(h)}h {int(m)}m {s:.1f}s"
+                if m >= 1:
+                    return f"{int(m)}m {s:.1f}s"
+                return f"{s:.1f}s"
+
+            def worker():
+                if params["mode"] == "file":
+                    inputs = [params["file"]]
+                else:
+                    inputs = _collect_pointclouds_from_folder(params["folder"], params["extensions"])
+                if not inputs:
+                    raise FileNotFoundError("No point cloud files found for the selected inputs.")
+
+                results = []
+                for path in inputs:
+                    res = slice_point_cloud_file(
+                        path,
+                        params["z_ranges"],
+                        output_dir,
+                        output_mode=params["output_mode"],
+                        raster_step=params.get("grid_size") or 1.0,
+                        dtm_step=params.get("grid_size") or 1.0,
+                        epsg=params.get("epsg") or 32633,
+                        make_hillshade=params.get("hillshade", False),
+                        stack_rasters=params.get("stack", False),
+                        normalize_dtm=True,
+                    )
+                    results.append(res)
+                return {"count": len(inputs), "results": results, "output_dir": output_dir}
+
+            def on_success(result):
+                self._running = False
+                self.run_button.config(state=tk.NORMAL)
+                elapsed = _fmt_duration(time.time() - start_time)
+                total_written = sum(len(r.get("written", [])) for r in result["results"])
+                skipped = sum(r.get("skipped", 0) for r in result["results"])
+                msg_lines = [
+                    f"Processed {result['count']} file(s).",
+                    f"Created {total_written} output file(s).",
+                ]
+                if skipped:
+                    msg_lines.append(f"Skipped {skipped} empty slice(s).")
+                msg_lines.append(f"Outputs saved to:\n{result['output_dir']}")
+                msg_lines.append(f"Processing time: {elapsed}")
+                self.status_var.set("Finished.")
+                messagebox.showinfo("Slice Point Cloud", "\n".join(msg_lines), parent=self)
+
+            def on_failure(exc):
+                self._running = False
+                self.run_button.config(state=tk.NORMAL)
+                self.status_var.set(f"Failed: {exc}")
+                messagebox.showerror("Slice Point Cloud failed", str(exc), parent=self)
+
+            self._running = True
+            self.run_button.config(state=tk.DISABLED)
+            self.status_var.set("Running...")
+
+            run_background_task(
+                start_status="Status: Slicing point cloud(s)...",
+                success_status="Status: Slicing completed.",
+                failure_status="Status: Slicing failed.",
+                worker_fn=worker,
+                success_callback=on_success,
+                failure_callback=on_failure,
+            )
+
+    def _collect_pointclouds_from_folder(folder, extensions):
+        """Return list of file paths matching extensions inside folder."""
+        normalized = []
+        for ext in extensions:
+            ext = ext.strip().lower()
+            if not ext:
+                continue
+            normalized.append(ext if ext.startswith(".") else f".{ext}")
+        if not normalized:
+            normalized = [".las", ".laz", ".ply", ".pcd", ".txt", ".xyz", ".asc", ".pts", ".xyzn", ".xyzrgb", ".e57"]
+
+        files = []
+        for name in os.listdir(folder):
+            candidate = os.path.join(folder, name)
+            if os.path.isfile(candidate) and os.path.splitext(candidate)[1].lower() in normalized:
+                files.append(os.path.normpath(candidate))
+        return sorted(files)
+
+    def open_slice_pointcloud_dialog():
+        dlg = SlicePointCloudDialog(root)
 
     class WatershedDialog(tk.Toplevel):
         """Interactive dialog with live preview for crown delineation."""
@@ -7928,7 +10553,7 @@ def DendRobotGUI():
 
     # Create the GUI window
     root.after(50, process_ui_queue)
-    root.title("DendRobot v0.5")
+    root.title("DendRobot v0.6")
 
     container = tk.Frame(root)
     container.pack(fill=tk.BOTH, expand=True)
@@ -8011,16 +10636,18 @@ def DendRobotGUI():
 
     menubar = tk.Menu(root)
     functions_menu = tk.Menu(menubar, tearoff=False)
-    functions_menu.add_command(label="Map Scalar Fields", command=map_scalar_fields_dialog)
     functions_menu.add_command(label="Crop Cloud by Extent", command=crop_by_extent_dialog)
+    functions_menu.add_command(label="Map Scalar Fields", command=map_scalar_fields_dialog)
+    functions_menu.add_command(label="Slice Point Cloud", command=open_slice_pointcloud_dialog)
     functions_menu.add_command(label="Watershed Crown Delineation", command=open_watershed_dialog)
+    functions_menu.add_command(label="Zonal Statistics", command=zonal_statistics_dialog)
     menubar.add_cascade(label="Functions", menu=functions_menu)
 
 
     help_menu = tk.Menu(menubar, tearoff=False)
     help_menu.add_command(label="See Console", command=open_console_window)
     help_menu.add_command(label="Processing Outputs Overview", command=open_outputs_overview)
-    help_menu.add_command(label="About", command=lambda: show_message(root, "About DendRobot", "DendRobot v0.5\n\nA tool for automatical forest inventory based on 3D point clouds.\n\nDeveloped at Czech University of Life Sciences in Prague\nAsk for support at hrdinam@fld.czu.cz"))
+    help_menu.add_command(label="About", command=lambda: show_message(root, "About DendRobot", "DendRobot v0.6\n\nA tool for automatical forest inventory based on 3D point clouds.\n\nDeveloped at Czech University of Life Sciences in Prague\nAsk for support at hrdinam@fld.czu.cz"))
     menubar.add_cascade(label="Help", menu=help_menu)
 
     root.config(menu=menubar)
@@ -8028,6 +10655,7 @@ def DendRobotGUI():
     def add_spinbox(row, label_text, var_cls, from_, to, increment, validate_func, tooltip_text, default_value):
         """Create a labelled spinbox and return its Tk variable alongside the widget."""
         var = var_cls()
+        integer_only = isinstance(var, tk.IntVar)
         spinbox = create_spinbox(
             content,
             row,
@@ -8039,6 +10667,7 @@ def DendRobotGUI():
             validate_func,
             tooltip_text,
             default_value,
+            integer_only=integer_only,
         )
         return var, spinbox
 
@@ -8163,44 +10792,60 @@ def DendRobotGUI():
     # reevaluate_checkbox.config(state=tk.DISABLED)
     # create_tooltip(reevaluate_label, "Skips parts of point cloud processing, reuses data from previous run and recalculates the DBHs, heights, etc.")  # Attach tooltip to the label
 
-    # segmentation Checkbox and Tooltip
-    segmentation_var = BooleanVar(value=False)
+    # Segmentation dropdown and Tooltip
+    SEGMENTATION_CHOICES = ["Off", "Keep all", "Keep trees only", "Keep all steps"]
+    segmentation_var = tk.StringVar(value="Off")
     segmentation_label = tk.Label(options_frame, text="Segmentation:")
     segmentation_label.grid(row=0, column=0, sticky="s", padx=10)
-    segmentation_checkbox = tk.Checkbutton(options_frame, variable=segmentation_var)
-    segmentation_checkbox.grid(row=1, column=0, padx=10, pady=5, sticky="s")
-    segmentation_checkbox.config(state=tk.NORMAL)
-    create_tooltip(segmentation_label, "Individual trees will be extracted from the point cloud and filtered.\nIncreases time consumption significantly.")  # Attach tooltip to the label
+    segmentation_menu = ttk.Combobox(
+        options_frame,
+        textvariable=segmentation_var,
+        values=SEGMENTATION_CHOICES,
+        state="readonly",
+        width=10,
+    )
+    segmentation_menu.grid(row=1, column=0, padx=10, pady=5, sticky="s")
+    create_tooltip(
+        segmentation_label,
+        "Controls tree segmentation and DenseCloudTrees export.\n"
+        "Off: no segmentation.\n"
+        "Keep all: include unassigned points (TreeID = -1).\n"
+        "Keep trees only: save only assigned tree points.\n"
+        "Keep all steps: save intermediate segmentation outputs (requires Debug On).",
+    )
 
-    # Debug Checkbox and Tooltip
-    debug_var = BooleanVar(value=False)
+    # Debug dropdown and Tooltip
+    DEBUG_CHOICES = ["Off", "On, .laz", "On, .txt"]
+    debug_var = tk.StringVar(value="Off")
     debug_label = tk.Label(options_frame, text="Debug:")
     debug_label.grid(row=0, column=2, sticky="s", padx=10)
-    debug_checkbox = tk.Checkbutton(options_frame, variable=debug_var)
-    debug_checkbox.grid(row=1, column=2, padx=10, pady=5, sticky="s")
-    create_tooltip(debug_label, "The outputs will contain most of the intermediate files from processing steps.")  # Attach tooltip to the label
-
-    FORMAT_CHOICES = [".laz", ".txt"]
-    outpcdformat_var = tk.StringVar(value=".laz")
-    debug_format_menu = ttk.Combobox(
+    debug_menu = ttk.Combobox(
         options_frame,
-        textvariable=outpcdformat_var,
-        values=FORMAT_CHOICES,
+        textvariable=debug_var,
+        values=DEBUG_CHOICES,
         state="readonly",
-        width=3,
+        width=10,
     )
-    debug_format_menu.grid(row=2, column=2, padx=10, pady=(0, 5), sticky="n")
+    debug_menu.grid(row=1, column=2, padx=10, pady=5, sticky="s")
     create_tooltip(
-        debug_format_menu,
-        "Output format for debug point clouds. Active only when Debug is enabled.",
+        debug_label,
+        "Controls debug exports and point-cloud format.\n"
+        "Off: no debug exports.\n"
+        "On, .laz: debug point clouds saved as LAZ.\n"
+        "On, .txt: debug point clouds saved as TXT.",
     )
 
-    def update_debug_controls(*args):
-        state = "readonly" if debug_var.get() else tk.DISABLED
-        debug_format_menu.configure(state=state)
+    def _segmentation_changed(*args):
+        seg_mode = segmentation_var.get()
+        if seg_mode == "Keep all steps" and debug_var.get() == "Off":
+            debug_var.set("On, .laz")
 
-    debug_var.trace_add("write", update_debug_controls)
-    update_debug_controls()
+    def _debug_changed(*args):
+        if debug_var.get() == "Off" and segmentation_var.get() == "Keep all steps":
+            segmentation_var.set("Off")
+
+    segmentation_var.trace_add("write", _segmentation_changed)
+    debug_var.trace_add("write", _debug_changed)
 
     # Horizontal black line (separator) under the Advanced Mode checkbox
     separator = tk.Frame(content, height=2, bd=1, relief="sunken", bg="black")
@@ -8210,58 +10855,403 @@ def DendRobotGUI():
         "3067 (ETRS89/TM35FIN(E,N))": 3067, 
         "3006 (SWEREF99 TM)": 3006, 
         "5514 (S-JTSK Krovak)": 5514,
-        "32631 (UTM-Belgium)": 32631,
-        "32630 (UTM-UK, Ghana)": 32630,
-        "32631 (UTM-France)": 32631,
         "32632 (UTM-Norway, Swiss)": 32632,
         "32633 (UTM-Czechia, Slovakia, Poland, Austria, Croatia, Denmark, Germany)": 32633,
         "32634 (UTM-Poland, Sweden)": 32634,
         "32635 (UTM-Finland)": 32635,
-        "32636 (UTM-Turkey)": 32636,
-        "32637 (UTM-Russia)": 32637,
-        "32643 (UTM-India)": 32643,
-        "32650 (UTM-China)": 32650,
-        "32618 (UTM-Canada, USA)": 32618,
-        "32723 (UTM-Brazil)": 32723,
     }
+
+    epsg_search_window = None
+    epsg_projected_cache = None
+
+    COUNTRY_NAMES = [
+        "Afghanistan", "Albania", "Algeria", "Andorra", "Angola",
+        "Antigua and Barbuda", "Argentina", "Armenia", "Australia", "Austria",
+        "Azerbaijan", "Bahamas", "Bahrain", "Bangladesh", "Barbados",
+        "Belarus", "Belgium", "Belize", "Benin", "Bhutan",
+        "Bolivia", "Bosnia and Herzegovina", "Botswana", "Brazil", "Brunei",
+        "Bulgaria", "Burkina Faso", "Burundi", "Cabo Verde", "Cambodia",
+        "Cameroon", "Canada", "Central African Republic", "Chad", "Chile",
+        "China", "Colombia", "Comoros", "Congo", "Costa Rica",
+        "Cote d'Ivoire", "Croatia", "Cuba", "Cyprus", "Czech Republic",
+        "Czechia", "Democratic Republic of the Congo", "Denmark", "Djibouti",
+        "Dominica", "Dominican Republic", "Ecuador", "Egypt", "El Salvador",
+        "Equatorial Guinea", "Eritrea", "Estonia", "Eswatini", "Ethiopia",
+        "Fiji", "Finland", "France", "Gabon", "Gambia", "Georgia", "Germany",
+        "Ghana", "Greece", "Grenada", "Guatemala", "Guinea", "Guinea-Bissau",
+        "Guyana", "Haiti", "Honduras", "Hungary", "Iceland", "India",
+        "Indonesia", "Iran", "Iraq", "Ireland", "Israel", "Italy", "Jamaica",
+        "Japan", "Jordan", "Kazakhstan", "Kenya", "Kiribati", "Kuwait",
+        "Kyrgyzstan", "Laos", "Latvia", "Lebanon", "Lesotho", "Liberia",
+        "Libya", "Liechtenstein", "Lithuania", "Luxembourg", "Madagascar",
+        "Malawi", "Malaysia", "Maldives", "Mali", "Malta",
+        "Marshall Islands", "Mauritania", "Mauritius", "Mexico",
+        "Micronesia", "Moldova", "Monaco", "Mongolia", "Montenegro",
+        "Morocco", "Mozambique", "Myanmar", "Namibia", "Nauru", "Nepal",
+        "Netherlands", "New Zealand", "Nicaragua", "Niger", "Nigeria",
+        "North Korea", "North Macedonia", "Norway", "Oman", "Pakistan",
+        "Palau", "Panama", "Papua New Guinea", "Paraguay", "Peru",
+        "Philippines", "Poland", "Portugal", "Qatar", "Romania", "Russia",
+        "Rwanda", "Saint Kitts and Nevis", "Saint Lucia",
+        "Saint Vincent and the Grenadines", "Samoa", "San Marino",
+        "Sao Tome and Principe", "Saudi Arabia", "Senegal", "Serbia",
+        "Seychelles", "Sierra Leone", "Singapore", "Slovakia", "Slovenia",
+        "Solomon Islands", "Somalia", "South Africa", "South Korea",
+        "South Sudan", "Spain", "Sri Lanka", "Sudan", "Suriname", "Sweden",
+        "Switzerland", "Syria", "Taiwan", "Tajikistan", "Tanzania",
+        "Thailand", "Timor-Leste", "Togo", "Tonga", "Trinidad and Tobago",
+        "Tunisia", "Turkey", "Turkmenistan", "Tuvalu", "Uganda", "Ukraine",
+        "United Arab Emirates", "United Kingdom", "United States", "Uruguay",
+        "Uzbekistan", "Vanuatu", "Vatican City", "Venezuela", "Vietnam",
+        "Yemen", "Zambia", "Zimbabwe", "Palestine"
+    ]
+
+    COUNTRY_ALIASES = {
+        "Czech Republic": ["Czechia"],
+        "United States": ["United States of America", "USA", "U.S.A.", "US"],
+        "United Kingdom": ["UK", "Great Britain", "Britain"],
+        "Russia": ["Russian Federation"],
+        "Iran": ["Islamic Republic of Iran"],
+        "Bolivia": ["Plurinational State of Bolivia", "Bolivia (Plurinational State of)"],
+        "Venezuela": ["Bolivarian Republic of Venezuela", "Venezuela (Bolivarian Republic of)"],
+        "Tanzania": ["United Republic of Tanzania"],
+        "Laos": ["Lao People's Democratic Republic"],
+        "Moldova": ["Republic of Moldova"],
+        "Syria": ["Syrian Arab Republic"],
+        "North Macedonia": ["Macedonia"],
+        "South Korea": ["Republic of Korea", "Korea, Republic of"],
+        "North Korea": ["Democratic People's Republic of Korea", "Korea, Democratic People's Republic of"],
+        "Myanmar": ["Burma"],
+        "Eswatini": ["Swaziland"],
+        "Cote d'Ivoire": ["Côte d'Ivoire", "Ivory Coast"],
+        "Cabo Verde": ["Cape Verde"],
+        "Brunei": ["Brunei Darussalam"],
+        "Vietnam": ["Viet Nam"],
+        "Congo": ["Republic of the Congo", "Congo, Republic of"],
+        "Democratic Republic of the Congo": ["Congo, Democratic Republic of the", "DRC"],
+        "Timor-Leste": ["East Timor"],
+        "Palestine": ["State of Palestine"],
+        "Micronesia": ["Federated States of Micronesia"],
+        "Bahamas": ["The Bahamas"],
+        "Gambia": ["The Gambia"],
+        "United Arab Emirates": ["UAE"],
+        "Saint Kitts and Nevis": ["St. Kitts and Nevis"],
+        "Saint Vincent and the Grenadines": ["St. Vincent and the Grenadines"],
+        "Saint Lucia": ["St. Lucia"],
+    }
+
+    _alias_to_country = None
+
+    def _build_alias_map():
+        nonlocal _alias_to_country
+        if _alias_to_country is not None:
+            return _alias_to_country
+        mapping = {}
+        for c in COUNTRY_NAMES:
+            mapping[c.lower()] = c
+        for base, aliases in COUNTRY_ALIASES.items():
+            for alias in aliases:
+                mapping[alias.lower()] = base
+        _alias_to_country = mapping
+        return mapping
+
+    def _normalize_country_name(text):
+        if not text:
+            return None
+        key = text.strip().lower()
+        if not key:
+            return None
+        return _build_alias_map().get(key, None)
+
+    def _country_aliases(country):
+        if not country:
+            return []
+        aliases = COUNTRY_ALIASES.get(country, [])
+        return [country] + aliases
+
+    def _get_projected_epsg_list():
+        """Return cached list of projected EPSG codes using metres."""
+        nonlocal epsg_projected_cache
+        if epsg_projected_cache is not None:
+            return epsg_projected_cache
+        try:
+            from pyproj import database
+            from pyproj.enums import PJType
+        except Exception as exc:
+            messagebox.showerror("EPSG Search", f"Unable to load EPSG database: {exc}")
+            epsg_projected_cache = []
+            return epsg_projected_cache
+
+        items = []
+        try:
+            infos = database.query_crs_info(auth_name="EPSG", pj_types=[PJType.PROJECTED_CRS])
+        except Exception as exc:
+            messagebox.showerror("EPSG Search", f"Failed to query EPSG list: {exc}")
+            epsg_projected_cache = []
+            return epsg_projected_cache
+
+        for info in infos:
+            try:
+                code = int(info.code)
+            except Exception:
+                continue
+            try:
+                crs = CRS.from_epsg(code)
+            except Exception:
+                continue
+            axis = crs.axis_info
+            if not axis:
+                continue
+            unit_ok = True
+            for ax in axis:
+                unit_name = (ax.unit_name or "").lower()
+                if "metre" not in unit_name and "meter" not in unit_name:
+                    unit_ok = False
+                    break
+            if not unit_ok:
+                continue
+            area_name = None
+            try:
+                area_name = info.area_of_use.name if info.area_of_use else None
+            except Exception:
+                area_name = None
+            items.append((code, info.name, area_name))
+
+        items.sort(key=lambda x: x[0])
+        epsg_projected_cache = items
+        return epsg_projected_cache
+
+    def open_epsg_search():
+        """Open searchable list of projected EPSG codes in metres."""
+        nonlocal epsg_search_window
+        if epsg_search_window and epsg_search_window.winfo_exists():
+            epsg_search_window.deiconify()
+            epsg_search_window.lift()
+            return
+
+        epsg_search_window = tk.Toplevel(root)
+        epsg_search_window.title("EPSG Search (Projected, metres)")
+        epsg_search_window.geometry("680x520")
+        epsg_search_window.transient(root)
+
+        def _close():
+            nonlocal epsg_search_window
+            if epsg_search_window and epsg_search_window.winfo_exists():
+                epsg_search_window.destroy()
+            epsg_search_window = None
+
+        epsg_search_window.protocol("WM_DELETE_WINDOW", _close)
+
+        frame = ttk.Frame(epsg_search_window)
+        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        search_var = tk.StringVar()
+        country_var = tk.StringVar(value="All")
+
+        ttk.Label(frame, text="Filter:").grid(row=0, column=0, sticky="w")
+        search_entry = ttk.Entry(frame, textvariable=search_var)
+        search_entry.grid(row=0, column=1, sticky="ew", padx=(6, 8))
+
+        clear_btn = ttk.Button(frame, text="Clear", command=lambda: search_var.set(""))
+        clear_btn.grid(row=0, column=2, sticky="e")
+
+        ttk.Label(frame, text="Country:").grid(row=0, column=3, sticky="w", padx=(10, 0))
+        country_menu = ttk.Combobox(
+            frame,
+            textvariable=country_var,
+            values=["All"] + sorted(COUNTRY_NAMES, key=str.lower),
+            state="normal",
+            width=22
+        )
+        country_menu.grid(row=0, column=4, sticky="w")
+
+        list_frame = ttk.Frame(frame)
+        list_frame.grid(row=1, column=0, columnspan=3, sticky="nsew", pady=(8, 0))
+
+        listbox = tk.Listbox(list_frame, height=18)
+        listbox.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        listbox.configure(yscrollcommand=sb.set)
+
+        count_label = ttk.Label(frame, text="")
+        count_label.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        def _populate_list(filter_text=""):
+            listbox.delete(0, tk.END)
+            items = _get_projected_epsg_list()
+            if not items:
+                listbox.insert(tk.END, "No EPSG entries available.")
+                count_label.config(text="")
+                return
+            q = (filter_text or "").strip().lower()
+            shown = 0
+            selected_country = _normalize_country_name(country_var.get())
+            for code, name, area in items:
+                display = f"{code} - {name}"
+                if q and q not in display.lower():
+                    continue
+                if selected_country:
+                    area_name = (area or "").lower()
+                    found = False
+                    for alias in _country_aliases(selected_country):
+                        if alias.lower() in area_name:
+                            found = True
+                            break
+                    if not found:
+                        continue
+                listbox.insert(tk.END, display)
+                shown += 1
+            count_label.config(text=f"Showing {shown} of {len(items)} projected CRS (metres)")
+
+        def _apply_selection(event=None):
+            sel = listbox.curselection()
+            if not sel:
+                return
+            text = listbox.get(sel[0])
+            if text.startswith("No EPSG"):
+                return
+            try:
+                code_str, name = text.split(" - ", 1)
+                code = int(code_str.strip())
+            except Exception:
+                return
+            epsg_var.set(f"{code} ({name})")
+            on_epsg_change()
+            _close()
+
+        def _on_search_change(*_):
+            _populate_list(search_var.get())
+
+        def _filter_country_list(*_):
+            text = country_var.get().strip().lower()
+            if not text:
+                country_menu.configure(values=["All"] + sorted(COUNTRY_NAMES, key=str.lower))
+                try:
+                    country_menu.tk.call("ttk::combobox::Unpost", country_menu)
+                except tk.TclError:
+                    pass
+                return
+            matches = [c for c in COUNTRY_NAMES if text in c.lower()]
+            if "all".startswith(text):
+                matches = ["All"] + matches
+            else:
+                matches = matches
+            values = matches if matches else ["All"] + sorted(COUNTRY_NAMES, key=str.lower)
+            country_menu.configure(values=values)
+            if matches:
+                try:
+                    country_menu.tk.call("ttk::combobox::Post", country_menu)
+                    country_menu.icursor(tk.END)
+                except tk.TclError:
+                    pass
+
+        def _on_country_focus_out(_):
+            val = country_var.get().strip()
+            if not val or val.lower() == "all":
+                country_var.set("All")
+                return
+            normalized = _normalize_country_name(val)
+            if normalized:
+                country_var.set(normalized)
+            else:
+                country_var.set("All")
+
+        search_entry.bind("<Return>", lambda e: _populate_list(search_var.get()))
+        search_var.trace_add("write", _on_search_change)
+        country_var.trace_add("write", _on_search_change)
+        country_menu.bind("<KeyRelease>", _filter_country_list)
+        country_menu.bind("<FocusOut>", _on_country_focus_out)
+        listbox.bind("<Double-Button-1>", _apply_selection)
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=3, column=0, columnspan=3, sticky="e", pady=(8, 0))
+        ttk.Button(btn_frame, text="Use Selected", command=_apply_selection).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(btn_frame, text="Close", command=_close).grid(row=0, column=1)
+
+        frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(1, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+        list_frame.columnconfigure(0, weight=1)
+
+        _populate_list()
+        search_entry.focus_set()
 
     epsg_label = tk.Label(content, text="EPSG Code:")
     epsg_label.grid(row=4, column=0, sticky="w", padx=10, pady=5)
     # Create the combobox for the Data Type field
     epsg_var = tk.StringVar(value="32633 (UTM-Czechia, Slovakia, Poland, Austria, Croatia, Denmark, Germany)")  # Default value is "32633"
+    epsg_frame = tk.Frame(content)
+    epsg_frame.grid(row=4, column=1, columnspan=2, padx=10, pady=5, sticky="w")
     epsg_menu = ttk.Combobox(
-        content,
+        epsg_frame,
         textvariable=epsg_var,
         values=list(EPSG_OPTIONS.keys()),
-        width=20  # Adjust width as needed
+        width=22
     )
-    epsg_menu.grid(row=4, column=1, padx=10, pady=5)
+    epsg_menu.grid(row=0, column=0, sticky="w")
+    epsg_search_btn = ttk.Button(epsg_frame, text="Search", command=open_epsg_search)
+    epsg_search_btn.grid(row=0, column=1, padx=(8, 0), sticky="w")
     epsg_menu.configure(postcommand=lambda: ensure_combobox_horizontal_scroll(epsg_menu))
 
     epsg_menu.bind("<<ComboboxSelected>>", on_epsg_change)
     epsg_menu.bind("<Return>", on_epsg_change)
     # Data Type Dropdown (Combobox) for Selecting Only Valid Options
     create_tooltip(epsg_label, "Code of the reference system, the input point cloud is in. Use only projected systems (in metres, not angles). The output files will be assigned this reference system too. Choose from menu or write the code into the entry.")
+    create_tooltip(epsg_search_btn, "Browse all projected EPSG codes.")
 
 
 
-    # Create the combobox for the Data Type field
-    datatype_var = tk.StringVar(value="MLS/TLS Raw")  # Default value is "raw"
-    datatype_menu = ttk.Combobox(
-        content,
-        textvariable=datatype_var,
-        values=["MLS/TLS Raw", "MLS/TLS Cropped", "iPhone LiDAR", "CRP", "UAV LiDAR", "ALS (1000 pts/m^2)" ],
-        state="readonly",  # Makes it readonly to prevent manual typing
-        width=20
+    # Data Type dropdowns (base + quality)
+    DATATYPE_BASE_CHOICES = [
+        "MLS/TLS",
+        "iPhone LiDAR",
+        "CRP",
+        "UAV LiDAR",
+        "ALS (1000 pts/m^2)",
+    ]
+    DATATYPE_QUALITY_CHOICES = ["Raw", "Cropped"]
+
+    datatype_type_var = tk.StringVar(value="MLS/TLS")
+    datatype_quality_var = tk.StringVar(value="Raw")
+
+    datatype_frame = tk.Frame(content)
+    datatype_frame.grid(row=5, column=1, columnspan=2, padx=10, pady=5, sticky="w")
+
+    datatype_type_menu = ttk.Combobox(
+        datatype_frame,
+        textvariable=datatype_type_var,
+        values=DATATYPE_BASE_CHOICES,
+        state="readonly",
+        width=16,
     )
-    datatype_menu.grid(row=5, column=1, padx=10, pady=5)  # Adjust row and column to match your layout
-    datatype_menu.set("MLS/TLS Raw")  # Set the default value
-    # Bind the function to the Combobox's <<ComboboxSelected>> event
-    datatype_menu.bind("<<ComboboxSelected>>", on_datatype_change)
-    # Data Type Dropdown (Combobox) for Selecting Only Valid Options
+    datatype_quality_menu = ttk.Combobox(
+        datatype_frame,
+        textvariable=datatype_quality_var,
+        values=DATATYPE_QUALITY_CHOICES,
+        state="readonly",
+        width=8,
+    )
+    datatype_type_menu.grid(row=0, column=0, sticky="w")
+    datatype_quality_menu.grid(row=0, column=1, padx=(8, 0), sticky="w")
+    try:
+        epsg_menu.configure(
+            width=int(datatype_type_menu.cget("width")) + int(datatype_quality_menu.cget("width")) + 5
+        )
+    except Exception:
+        pass
+    datatype_type_menu.bind("<<ComboboxSelected>>", on_datatype_change)
+    datatype_quality_menu.bind("<<ComboboxSelected>>", on_datatype_change)
+
     datatype_label = tk.Label(content, text="Data Type:")
     datatype_label.grid(row=5, column=0, sticky="w", padx=10, pady=5)
-    create_tooltip(datatype_label, "This slightly modifies parameters of algorithm to better adapt to some features of different data sources. Use 'MLS/TLS Raw' if the point cloud wasn't cropped. If it was cropped, use 'MLS/TLS Cropped' to avoid losing peripheral trees. In case iPhone LiDAR or terrestrial photogrammetry data use 'iPhone LiDAR' or 'CRP'. For UAV LiDAR and high-density airborne LiDAR ('ALS (1000 pts/m^2)') there are dedicated options too.")
+    create_tooltip(
+        datatype_label,
+        "Select the base data source and whether it is Raw or Cropped.\n"
+        "Raw/Cropped affects the extra DTM SOR filtering passes for any data type.\n"
+        "MLS/TLS and ALS (1000 pts/m^2) also use it for preset tuning.",
+    )
+    on_datatype_change()
 
 
   
@@ -8297,7 +11287,7 @@ def DendRobotGUI():
         100.0,
         1.0,
         validate_chunksize,
-        "The size of square-shaped areas that are each filtered to remove terrain and keep trees. Lower values may lead to better detection of understory, but also to greater ammount of unfiltered terrain, mainly in sparsely grown up places. Higher value leads to greater focus on main canopy level.",
+        "The size of square-shaped areas that are each filtered to remove terrain and keep trees. This parameter solves varying density of point cloud across its extent. Lower values may lead to better detection of understory, but also to greater ammount of unfiltered terrain, mainly in sparsely grown up places. Higher value leads to greater focus on main canopy level.",
         10.0,
     )
 
@@ -8338,7 +11328,7 @@ def DendRobotGUI():
     )
 
     def update_segmentation_controls(*args):
-        state = tk.NORMAL if segmentation_var.get() else tk.DISABLED
+        state = tk.NORMAL if segmentation_var.get() != "Off" else tk.DISABLED
         segmentationgap_spinbox.config(state=state)
         segmentationminheight_spinbox.config(state=state)
 
