@@ -15,24 +15,22 @@ Another option is to download the `.exe` file from [DendRobot Download Page](htt
 # Input Parameters
 The input parameters should be adjusted according to the specific input data, either by changing the **Data Type** parameter or by modifying individual parameters manually. The default settings are optimized for most terrestrial or mobile LiDAR scans.
 
-| Parameter Name               | Type    | Recommended Range                          | Default Value | Meaning |
-|------------------------------|---------|--------------------------------------------|--------------|---------|
-| Point Cloud Data Path        | String  | N/A                                        | None         | Path of a point cloud file to be processed. Multiple paths can be provided. |
-| Debug                        | Boolean | True / False                               | False        | If set to True, intermediate files at each processing step will be generated and saved to the computer. Intermediate point clouds can be stored in either “.txt” or “.laz” formats. |
-| Segmentate                        | Boolean | True / False                               | False        | If set to True, individual trees will be extracted from the input point cloud and saved into a comprehensive point cloud file. Individual tree crown projections will also be saved as a separate shapefile. Use together with Debug, to save unclassified points too. |
-| EPSG Code                    | Integer | Projected Coordinate Systems only          | 32633        | If the point cloud is georeferenced, the processing outputs will be assigned the specified EPSG code. |
-| Data Type                    | String  | 'MLS Raw'; 'MLS Cropped'; 'iPhone LiDAR'; 'CRP'; 'UAV LiDAR'; ‘ALS (1000 pts/m^2)’ | 'MLS Raw'  | The source of the point cloud. Based on the selected option, other parameters will be adjusted to more appropriate default values, and the processing algorithm will vary accordingly. |
-| Maximal DBH                 | Float   | 0.1 to 5                                   | 1.5          | A threshold for filtering out trees with unrealistic DBH estimate. |
-| Subsampling Step             | Float   | 0.01 to 0.2                                | 0.05         | The minimum step size between points in the subsampled point cloud created during initial processing steps.|
-| Filter-Chunk Size            | Float   | 1 to 100                                   | 10           | The sensitivity of density filtering to smaller objects. Higher values result in detecting only larger trees, whereas excessively low values may lead to improper terrain removal. |
-| DTM Resolution               | Float   | 0.5 to 5                                   | 1            | The grid step for detecting minima within each grid cell. The DSM is generated at four times finer resolution. |
-| Segmentation Gap            | Float   | 0.01 to 1                                | 0.05         | The spatial gap which is used for filtering non-tree objects. The lower, the more reliable segmentation, but larger potential loss of details. |
-| Segmentation Min Height            | Float   | 0.01 to 1                                | 0.05         | Points below this height above the terrain are ignored during segmentation to reduce ground artefacts. Use lower values only if there is not any undergrowth.|
-| Cross Section Thickness      | Float   | 0.01 to 1.0                                | 0.07         | The size of the cross-section, which will later be used for RANSAC Circle Fitting. |
-| Cross Sections Count         | Integer | 1 to Any                                     | 3            | The number of cross-sections extracted for each tree, which will be used for RANSAC Circle Fitting. |
-| Cross Section Step      | Float   | 0.1 to 1.0                                | 1         | Determines how far from each other the cross-sections will be made. The first cross–section is always made at 1.3 m above terrain. |
-
-
+| Parameter | Type | Options / Range | Default | Meaning |
+|---|---|---|---|---|
+| Point Cloud Data Path | String (path) | N/A | empty | Path(s) to input point cloud(s). Multiple paths can be added. |
+| Debug | Enum | Off / On, .laz / On, .txt | Off | Controls debug exports and the point‑cloud format for intermediates. |
+| Segmentation | Enum | Off / Keep all / Keep trees only / Keep all steps | Off | Controls tree segmentation output. “Keep all steps” requires Debug On. |
+| EPSG Code | Integer | Projected CRS (meters) | 32633 | Output CRS for all georeferenced results. |
+| Data Type | Enum (base + quality) | Base: MLS/TLS, iPhone LiDAR, CRP, UAV LiDAR, ALS (1000 pts/m²); Quality: Raw/Cropped | MLS/TLS + Raw | Source type and preset tuning (Raw/Cropped affects extra DTM filtering). |
+| Maximal DBH | Float | 0.1 – 5.0 | 1.5 | Upper DBH threshold (m) to filter unrealistic trees. |
+| Subsampling Step | Float | 0.01 – 0.2 | 0.05 | Min spacing for subsampled cloud. Keep smaller than Cross Section Thickness. |
+| Filter‑Chunk Size | Float | 1.0 – 100.0 | 10.0 | Chunk size for density filtering. Smaller detects a larger proportion of understory, larger favours the main canopy. |
+| DTM Resolution | Float | 0.5 – 5.0 | 1.0 | Raster grid step for DTM creation. |
+| Segmentation Gap | Float | 0.01 – 1.0 | 0.05 | Spatial gap for filtering non‑tree objects. |
+| Segmentation Min Height | Float | 0.0 – 5.0 | 1.0 | Minimum above‑ground height used in segmentation. Points below this height are ignored.|
+| Cross Section Thickness | Float | 0.01 – 1.0 | 0.07 | Disc thickness for DBH and stem location. |
+| Cross Sections Count | Integer | 1 – 5000 | 3 | Number of height levels (1.3 m always included). |
+| Cross Section Step | Float | 0.01 – 2.0 | 1.0 | Vertical spacing between additional slices above 1.3 m. |
 
 
 # Outputs
