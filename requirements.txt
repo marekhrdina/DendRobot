@@ -5,10 +5,12 @@ geopandas
 joblib
 laspy
 laszip
-numpy
+matplotlib
+numpy==1.26.4
 numba
-opencv-python
+opencv-python==4.10.0.84
 open3d
+openpyxl
 pandas
 pillow
 plyfile
@@ -20,5 +22,36 @@ rasterio
 scipy
 scikit-image
 scikit-learn
-shapely
+shapely==2.0.7
 tkinterdnd2
+dbfread
+pyinstaller
+
+# Optional classification algorithms:
+# hdbscan
+# xgboost
+
+# Optional GPU acceleration for segmentation KNN, density, scalar mapping,
+# verticality, and moderate DTM nearest-cell lookups.
+# Install PyTorch separately after the base requirements. Do not install both
+# variants into the same virtual environment.
+#
+# Older Pascal GPUs such as Quadro P4000 / GTX 10xx / compute capability sm_61:
+#   pip install torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cu118
+#
+# Newer NVIDIA GPUs:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+#
+# Optional FAISS GPU nearest-neighbour backend:
+# DendRobot can use FAISS only when the installed "faiss" package exposes GPU
+# resources such as StandardGpuResources/index_cpu_to_gpu. The Windows pip
+# package faiss-cpu is intentionally not listed here because it does not provide
+# that GPU backend and is usually not faster than the existing CPU cKDTree path.
+# A CUDA-matched FAISS GPU build is normally installed via conda or WSL2/Linux,
+# not from this portable Windows pip requirements file.
+#
+# RAPIDS cuML is platform/CUDA-specific and is usually installed via conda or WSL2/Linux,
+# not from a portable pip requirements file on Windows.
+# Install matching RAPIDS packages separately when a CUDA-capable Linux/WSL environment is available:
+#   cupy-cuda12x
+#   cuml
